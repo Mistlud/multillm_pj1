@@ -8,6 +8,31 @@
 
 **최소 기반 1차 구현과 사용자 기본 테스트를 마쳤다.** 로컬 서버·SQLite 저장소·웹 UI와 Mock/Vertex/OpenAI 호환 어댑터를 구현했다. 2026-10-01 사용자가 두 테스트 가이드의 ‘개발 변경 때만’을 제외한 모든 항목을 통과했다고 보고했다. PC·스마트폰의 기본 사용 흐름은 확인됐으며 실제 Provider 호출은 아직 미검증이다.
 
+**화면 디자인은 개선 과제다.** 사용자는 현재 디자인에 강한 불만을 표시했다. 기능 테스트 통과가 UX/UI 승인이라는 뜻은 아니다. 화면 리디자인은 낮은 우선순위의 후속 과제이며 방향은 아직 정하지 않았다.
+
+## 새 세션에서 이어가기
+
+이 문서로 실행·구조를 파악하고, **PLAN.md의 작업 순서·작업 원칙**, **PROGRESS.md의 확인 결과·남은 범위**를 읽는다. 세 문서에 현재 작업 재개에 필요한 결정과 상태를 모았다. 초기 설계·검토 문서는 배경 자료이며, 새로운 변경에 관련된 경우에만 추가로 읽는다.
+
+- 작업 폴더: `C:\ccy\multillm_pj1`
+- Git: `https://github.com/Mistlud/multillm_pj1.git`, `origin`, `main`
+- 다음 우선 작업: 이미 작성된 Vertex 어댑터로 실제 사용할 계정·인증정보·모델 연결 준비. 계정·모델 선택은 사용자와 맞춘다.
+- 현재 로그인/CSS 문제는 해결됐고 기본 흐름은 사용자 확인 완료다. 초기 구현이나 같은 테스트를 반복하는 것부터 시작하지 않는다.
+- 개발·실행 환경은 이미 준비돼 있다. 새 설치·환경 탐색·테스트 인프라 구축은 기본 재개 절차가 아니다.
+
+## 코드 위치
+
+| 경로 | 담당 기능 |
+|---|---|
+| `src/core/room-store.ts` | SQLite schema·migration, 불변 저장, R1000 전환, cycle·cursor·메모·usage, 검색, `DEFAULT_LIMITS` |
+| `src/core/worker-manager.ts` | 독립 polling, 중복 실행 방지, 고정 스냅샷·읽기 왕복, OFF·종료·오류 처리 |
+| `src/core/types.ts`, `actions.ts`, `tokens.ts` | 공통 타입·action 검증·길이 정책 |
+| `src/adapters/index.ts` | Mock·Vertex·OAI-compatible·Custom API, prompt 구성, 입력 한도·usage 정규화 |
+| `src/server/app.ts`, `config.ts`, `main.ts` | HTTP API·인증, 환경 설정, 시작·종료 |
+| `src/server/credentials.ts` | Windows DPAPI 인증정보 저장 |
+| `public/index.html`, `public/style.css`, `src/web/app.ts` | 화면 구조·스타일·브라우저 동작 |
+| `test/` | 기존 자동 검증. 이름만 보고 완전한 동시성·실운영 검증으로 해석하지 않는다. |
+
 현재 작성된 구현 문서는 다음과 같다.
 
 - [PLAN.md](./PLAN.md): 구현 기준, 검토 보완 사항, 단계별 산출물과 검증 기준
@@ -113,7 +138,7 @@ Participant와 Connection은 분리한다. 연결이나 모델을 바꿔도 참�
 
 ## 다음 작업
 
-Mock 기본 흐름을 사용한 뒤 실제 Vertex 한 참가자를 연결한다. 실제 계정·인증정보와 모델 호출은 아직 사용하지 않았다.
+다음은 실제 Vertex 한 참가자의 연결 준비다. 실제 계정·인증정보와 모델 호출은 아직 사용하지 않았다. Connection 수정·인증정보 교체, 추가 어댑터·native tool calling과 낮은 우선순위의 화면 리디자인은 PLAN.md의 후속 목록을 따른다.
 
 `npm run build`는 타입 검사와 실행 파일 생성을 수행한다. 자동 검증은 `npm test`로 실행한다. 다중 DB 연결 경합·강제 종료 시점별 검증, 실제 Provider·장기 운영 검증은 남아 있다. 새 테스트 인프라와 진단 스크립트는 추가하지 않았다.
 
