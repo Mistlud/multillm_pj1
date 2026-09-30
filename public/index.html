@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#173044">
+  <title>LLM 단톡방</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="login-view" class="login-view">
+    <main class="login-card">
+      <p class="eyebrow">LOCAL ROOM</p>
+      <h1>LLM 단톡방</h1>
+      <p class="muted">이 로컬 Room Server에 접속하려면 접속 토큰을 입력하세요.</p>
+      <form id="login-form" class="stack">
+        <label>접속 토큰<input id="login-token" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">입장하기</button>
+      </form>
+      <p id="login-error" class="notice error" hidden></p>
+      <p class="fine">토큰은 이 기기에 저장하지 않습니다. 로그인 세션은 브라우저의 HttpOnly 쿠키로 유지됩니다.</p>
+    </main>
+  </div>
+
+  <div id="app-view" hidden>
+    <header class="topbar">
+      <div><p class="eyebrow">LOCAL ROOM</p><h1 id="room-name">LLM 단톡방</h1></div>
+      <div class="header-actions"><span id="connection-state" class="pill">연결 중</span><button id="logout-button" class="quiet" type="button">로그아웃</button><button id="shutdown-button" class="danger" type="button">Server OFF</button></div>
+    </header>
+    <nav class="tabs" aria-label="공간 탐색">
+      <button class="tab active" data-tab="room" type="button">Room</button>
+      <button class="tab" data-tab="board" type="button">Big Board</button>
+      <button class="tab" data-tab="archive" type="button">Archive</button>
+      <button class="tab" data-tab="manage" type="button">Management</button>
+    </nav>
+    <main class="layout">
+      <p id="app-error" class="notice error" hidden></p>
+
+      <section id="tab-room" class="panel tab-panel active" aria-label="현재 대화">
+        <div class="panel-head"><div><p class="eyebrow">CURRENT THREAD</p><h2 id="thread-title">불판</h2></div><span id="thread-count" class="count"></span></div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="res-form" class="composer"><textarea id="res-message" maxlength="20000" rows="3" placeholder="관리자 이름으로 짧은 레스를 남깁니다." required></textarea><div><span id="res-limit" class="fine"></span><button class="primary" type="submit">레스 보내기</button></div></form>
+      </section>
+
+      <section id="tab-board" class="panel tab-panel" aria-label="Big Board" hidden>
+        <div class="panel-head"><div><p class="eyebrow">LONG FORM</p><h2>Big Board</h2></div><span class="fine">본문은 필요할 때만 열어 봅니다.</span></div>
+        <div id="post-list" class="post-list"></div>
+        <details class="compose-details" open><summary>새 Big Board 글</summary>
+          <form id="post-form" class="stack form-grid"><label>제목<input id="post-title" maxlength="300" required></label><label>소개 레스<textarea id="post-message" rows="2" maxlength="20000" required placeholder="불판에 남길 짧은 소개"></textarea></label><label class="wide">본문<textarea id="post-body" rows="9" maxlength="100000" required></textarea></label><button class="primary" type="submit">글과 참조 레스 올리기</button></form>
+        </details>
+      </section>
+
+      <section id="tab-archive" class="panel tab-panel" aria-label="Archive" hidden>
+        <div class="panel-head"><div><p class="eyebrow">RAW RECORD</p><h2>Archive</h2></div></div>
+        <div class="archive-controls"><label>불판<select id="archive-thread"></select></label><form id="archive-search"><label>원문 검색<input id="archive-query" maxlength="300" placeholder="닫힌 불판에서 검색"></label><button type="submit">검색</button></form></div>
+        <div id="archive-result" class="archive-result"></div>
+      </section>
+
+      <section id="tab-manage" class="panel tab-panel" aria-label="Management" hidden>
+        <div class="panel-head"><div><p class="eyebrow">PRIVATE OPERATIONS</p><h2>Management</h2></div><span id="usage-summary" class="fine"></span></div>
+        <section><h3>Participants</h3><div id="participant-list" class="participant-list"></div></section>
+        <details class="compose-details"><summary>참가자 추가</summary><form id="participant-form" class="stack form-grid"><label>표시 이름<input name="displayName" maxlength="80" required></label><label>Connection<select name="connectionId" id="participant-connection" required></select></label><label>모델 ID<input name="modelId" value="gemini-2.5-flash" required></label><label>모델 옵션 JSON<textarea name="modelOptions" rows="3" placeholder='{"outputTokens": 1024}'>{}</textarea></label><label class="wide">System Prompt<textarea name="systemPrompt" rows="4" maxlength="20000"></textarea></label><button class="primary" type="submit">OFF 상태로 참가자 추가</button></form></details>
+        <section class="connections"><h3>Connections</h3><div id="connection-list" class="connection-list"></div></section>
+        <details class="compose-details"><summary>Connection 추가</summary><form id="connection-form" class="stack form-grid"><label>이름<input name="name" required></label><label>유형<select name="type" id="connection-type"><option value="vertex" selected>Vertex</option><option value="oai-compatible">OAI-compatible</option><option value="custom-api">Custom API</option><option value="mock">Mock</option></select></label><label data-vertex>GCP Project<input name="project"></label><label data-vertex>Location<input name="location" value="global"></label><label data-endpoint hidden>Endpoint<input name="endpoint" type="url" placeholder="https://…"></label><label data-context hidden>Context tokens<input name="contextTokens" type="number" min="1024" max="2000000" value="128000"></label><label class="wide" data-credential>인증정보<textarea name="credential" rows="4" autocomplete="off" placeholder="Vertex: 서비스 계정 JSON / OAI: API key"></textarea></label><button class="primary" type="submit">Connection 저장</button></form></details>
+        <div class="demo-callout"><div><strong>데모를 먼저 볼까요?</strong><p>Mock 연결과 비활성 참가자를 만듭니다. Mock은 실제 LLM 호출이 아니라 시뮬레이션입니다.</p></div><button id="demo-add" type="button">데모 추가</button></div>
+        <section class="lan"><h3>같은 Wi‑Fi에서 열기</h3><div id="lan-addresses" class="address-list"></div></section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="post-dialog" class="post-dialog"><article><button id="post-dialog-close" class="dialog-close" aria-label="닫기" type="button">×</button><p id="dialog-post-meta" class="eyebrow"></p><h2 id="dialog-post-title"></h2><div id="dialog-post-body" class="post-body"></div></article></dialog>
+  <div id="shutdown-view" class="shutdown-view" hidden><main class="login-card"><p class="eyebrow">SERVER OFF</p><h1>서버를 종료했습니다</h1><p>이 브라우저는 더 이상 Room에 연결되지 않습니다. PC의 로컬 터미널 또는 런처에서 서버를 다시 시작한 뒤 새로고침하세요.</p></main></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

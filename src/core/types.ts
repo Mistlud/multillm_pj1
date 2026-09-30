@@ -1,0 +1,288 @@
+export type Id = string;
+export type AuthorType = "admin" | "participant";
+export type ThreadStatus = "open" | "closed";
+export type CycleStatus = "calling" | "completed" | "failed" | "abandoned" | "input_blocked";
+export type RuntimeStatus = "idle" | "calling" | "error" | "input_blocked" | "off";
+
+export interface CoreLimits {
+  messageTokens: number;
+  privateMemoTokens: number;
+  postTokens: number;
+  inputTokens: number;
+  outputReserveTokens: number;
+  toolReturnTokens: number;
+  retryBackoffMs: number;
+  maxToolRounds: number;
+  cycleTimeoutMs: number;
+  minPollMs: number;
+  maxPollMs: number;
+}
+
+export interface Room {
+  id: Id;
+  name: string;
+  currentThreadId: Id;
+  createdAt: number;
+}
+
+export interface Thread {
+  id: Id;
+  roomId: Id;
+  number: number;
+  status: ThreadStatus;
+  resCount: number;
+  createdAt: number;
+  closedAt: number | null;
+}
+
+export interface PublicRes {
+  id: number;
+  threadId: Id;
+  threadNumber: number;
+  number: number;
+  author: { type: AuthorType; id: Id | null; displayName: string };
+  body: string;
+  postId: number | null;
+  generatedFrom: Cursor | null;
+  createdAt: number;
+}
+
+export interface Post {
+  id: number;
+  roomId: Id;
+  author: { type: AuthorType; id: Id | null; displayName: string };
+  title: string;
+  body: string;
+  createdAt: number;
+}
+
+export interface Cursor {
+  threadId: Id;
+  resNumber: number;
+}
+
+export interface Connection {
+  id: Id;
+  name: string;
+  type: string;
+  config: Record<string, unknown>;
+  credentialRef: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface Participant {
+  id: Id;
+  roomId: Id;
+  displayName: string;
+  avatar: string | null;
+  enabled: boolean;
+  connectionId: Id | null;
+  modelId: string;
+  modelOptions: Record<string, unknown>;
+  systemPrompt: string;
+  privateMemo: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ParticipantRuntime {
+  participantId: Id;
+  observed: Cursor | null;
+  lastPosted: Cursor | null;
+  nextPollAt: number | null;
+  status: RuntimeStatus;
+  activeCycleId: Id | null;
+  lastError: string | null;
+  blockedAt: Cursor | null;
+  blockedInputSignature: string | null;
+  permanentError: boolean;
+}
+
+export interface ParticipantDetail extends Participant {
+  runtime: ParticipantRuntime;
+}
+
+export interface UsageRecord {
+  id: number;
+  participantId: Id;
+  connectionId: Id | null;
+  cycleId: Id;
+  requestId: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+  providerUsage: Record<string, unknown> | null;
+  createdAt: number;
+}
+
+export interface UsageSummary {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+}
+
+export interface CycleSnapshot {
+  threadId: Id;
+  threadNumber: number;
+  latestResNumber: number;
+  maxPostId: number;
+  observedBefore: Cursor | null;
+}
+
+export interface Cycle {
+  id: Id;
+  participantId: Id;
+  roomId: Id;
+  serverRunId: Id;
+  snapshot: CycleSnapshot;
+  inputSignature: string;
+  status: CycleStatus;
+  startedAt: number;
+  completedAt: number | null;
+  error: string | null;
+}
+
+export interface AddConnectionInput {
+  id?: Id;
+  name: string;
+  type: string;
+  config?: Record<string, unknown>;
+  credentialRef?: string | null;
+}
+
+export interface UpdateConnectionInput {
+  name?: string;
+  type?: string;
+  config?: Record<string, unknown>;
+  credentialRef?: string | null;
+}
+
+export interface AddParticipantInput {
+  id?: Id;
+  roomId: Id;
+  displayName: string;
+  avatar?: string | null;
+  enabled?: boolean;
+  connectionId?: Id | null;
+  modelId: string;
+  modelOptions?: Record<string, unknown>;
+  systemPrompt?: string;
+  privateMemo?: string;
+}
+
+export interface UpdateParticipantInput {
+  displayName?: string;
+  avatar?: string | null;
+  enabled?: boolean;
+  connectionId?: Id | null;
+  modelId?: string;
+  modelOptions?: Record<string, unknown>;
+  systemPrompt?: string;
+  privateMemo?: string;
+}
+
+export interface AppendResInput {
+  roomId: Id;
+  author: PublicRes["author"];
+  body: string;
+  generatedFrom?: Cursor | null;
+}
+
+export type ParticipantAction =
+  | { action: "wait"; memo?: string | null }
+  | { action: "reply"; message: string; memo?: string | null }
+  | { action: "post"; title: string; body: string; message: string; memo?: string | null }
+  | { action: "read_archive"; query: string }
+  | { action: "read_res"; thread: number; res: number }
+  | { action: "read_range"; thread: number; from: number; to: number }
+  | { action: "read_post"; postId: number };
+
+export type FinalAction = Extract<ParticipantAction, { action: "wait" | "reply" | "post" }>;
+export type ReadAction = Exclude<ParticipantAction, FinalAction>;
+
+export interface ActionResult {
+  action: unknown;
+  usage?: AdapterUsage;
+}
+
+export interface AdapterUsage {
+  requestId?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  raw?: Record<string, unknown>;
+}
+
+export interface ModelInput {
+  participantName: string;
+  systemPrompt: string;
+  privateMemo: string;
+  currentThread: {
+    id: Id;
+    number: number;
+    latestResNumber: number;
+    isRolloverSinceObserved: boolean;
+    newlyObservedAfter: number;
+    messages: Array<{ thread: number; res: number; author: string; content: string }>;
+    postReferences: Array<{ id: number; title: string; author: string }>;
+  };
+}
+
+export interface ToolResult {
+  action: ReadAction;
+  content: unknown;
+}
+
+export interface AdapterParticipant {
+  id: Id;
+  connectionId: Id | null;
+  modelId: string;
+  modelOptions: Record<string, unknown>;
+}
+
+export interface AdapterRequest {
+  participant: AdapterParticipant;
+  input: ModelInput;
+  history: ToolResult[];
+  signal: AbortSignal;
+}
+
+export interface ParticipantAdapter {
+  /** Absent adapters use the conservative core cl100k_base budget; they are never unlimited. */
+  inputBudget?: {
+    maxInputTokens: number;
+    outputReserveTokens: number;
+    countInputTokens?: (request: Pick<AdapterRequest, "input" | "history">) => number;
+  };
+  run(request: AdapterRequest): Promise<ActionResult>;
+}
+
+/** Adapter implementations may expose retry policy without leaking provider errors into the Room. */
+export class AdapterError extends Error {
+  readonly retryAfterMs: number | null;
+  readonly permanent: boolean;
+  readonly usage: AdapterUsage | undefined;
+  readonly inputBlocked: boolean;
+  constructor(message: string, options: { retryAfterMs?: number | null; permanent?: boolean; usage?: AdapterUsage; inputBlocked?: boolean } = {}) {
+    super(message);
+    this.name = "AdapterError";
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.permanent = options.permanent ?? false;
+    this.usage = options.usage;
+    this.inputBlocked = options.inputBlocked ?? false;
+  }
+}
+
+export type AdapterResolver = (participant: Participant, connection: Connection | null) => ParticipantAdapter | undefined;
+
+export interface WorkerManagerOptions {
+  serverRunId?: Id;
+  adapters: AdapterResolver;
+  limits?: Partial<CoreLimits>;
+  now?: () => number;
+  random?: () => number;
+  setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
