@@ -1,7 +1,7 @@
 # 구현 계획
 
 작성일: 2026-09-30  
-상태: 최소 기반 1차 구현. 저장소·Worker·서버·웹 UI·어댑터 코드를 작성했으며 실제 Provider 및 브라우저 사용 검증은 남아 있다.
+상태: 최소 기반 1차 구현 및 사용자 기본 테스트 통과. PC·스마트폰의 Mock 기본 흐름을 확인했으며 실제 Provider 호출은 남아 있다. 결과는 [PROGRESS.md](./PROGRESS.md)에 기록한다.
 
 ## 1. 문서의 역할과 범위
 
@@ -145,7 +145,7 @@ Participant OFF와 서버 프로세스 종료를 구분한다.
 ## 6. 구현 진행표
 
 - [x] PLAN.md와 README.md 작성
-- [ ] Phase 0 — 실행 골격
+- [x] Phase 0 — 실행 골격
 - [ ] Phase 1 — 저장과 불판
 - [ ] Phase 2 — Big Board와 protocol
 - [ ] Phase 3 — Worker와 가짜 adapter
@@ -161,12 +161,12 @@ Participant OFF와 서버 프로세스 종료를 구분한다.
 
 | 범위 | 구현 상태 | 남은 작업·확인 |
 |---|---|---|
-| Phase 0 | Node/TypeScript, SQLite, 토큰 인증, 시작·종료, LAN URL 표시 | 실제 PC·스마트폰 화면 접근 |
+| Phase 0 | 실행 골격 및 PC·스마트폰 기본 접근 확인 완료 | 없음 |
 | Phase 1~2 | 불변 레스·게시글, R1000 전환, 길이 검사, 원자 저장, action schema | 다중 DB 연결 경합·강제 종료 시점별 검증 |
 | Phase 3 | Mock, 독립 polling, 고정 스냅샷, cursor·메모·usage, ON/OFF·재시작 복구 | 장기 운영 중 상태 전이 |
 | Phase 4 | Vertex REST·서비스 계정·DPAPI·usage·입력 한도 처리 | 실제 계정 호출 |
 | Phase 5 | 공개 읽기 도구, 반환량·왕복·시간 제한, FTS5/어휘 색인 fallback | native tool calling |
-| Phase 6 | Room·Big Board·Archive·관리 반응형 UI | 브라우저 조작 및 스마트폰 사용 |
+| Phase 6 | Room·Big Board·관리 기본 조작 및 스마트폰 사용 통과, Archive UI 구현 | 종료된 불판 검색·실제 연결 설정 운영 확인 |
 | Phase 7 | OAI-compatible, 같은 형식의 Custom API | 실제 endpoint, Codex/Claude Code, 임의 API 형식 |
 | Phase 8 | 미진행 | 실제 다중 참가자·장기 구동·비용 관찰 |
 
@@ -178,6 +178,12 @@ Participant OFF와 서버 프로세스 종료를 구분한다.
 - 변경 관련 8개 자동 검증 통과: 작성자 ID·방 소속, 입력 설정 변경 후 차단 재검사, 게시글 읽기 스냅샷, 영구 오류의 재시작 보존·복구, 참여자 중복 실행, OFF·서버 종료, HTTP/Mock 기본 흐름, 한글 자격증명 저장·복원.
 - 샌드박스의 `spawn EPERM`으로 테스트 프로세스 생성이 차단되어 승인된 실행으로 같은 명령만 재실행했다.
 - 이전 전체 테스트 묶음은 반복하지 않았다. 이번에 변경하지 않은 보관함 검색·호환 API 세부 동작 등의 재검증, 실제 Provider·브라우저·모바일·장기 구동은 미뤘다.
+
+### 사용자 확인 기록 (2026-10-01)
+
+사용자가 두 가이드의 **‘개발 변경 때만’을 제외한 모든 항목**을 통과했다고 보고했다. PC·스마트폰 로그인, Room, Mock 응답·호출 생략·OFF, Big Board, 서버 종료·재시작·기록 보존을 확인했다. 로그인 화면의 `hidden` 속성을 CSS가 덮어쓰는 문제도 수정했다.
+
+이번 문서 갱신에서는 빌드·자동 테스트를 반복하지 않았다. 실제 Provider 및 장기 구동 등 가이드 밖 범위는 미검증이며, 상세 기록과 남은 범위는 PROGRESS.md를 따른다.
 
 ## 7. MVP 범위 밖
 
