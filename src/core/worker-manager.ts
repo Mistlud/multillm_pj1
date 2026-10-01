@@ -54,6 +54,21 @@ export class WorkerManager {
     if (enabled && this.started && !this.stopped) this.schedule(participantId);
   }
 
+  /** Called only after a participant has been soft-deleted from the store. */
+  removeParticipant(participantId: string): void {
+    this.clearSchedule(participantId);
+    this.retryDelays.delete(participantId);
+  }
+
+  /** A changed shared connection is used by the next cycle; active cycles keep their claim snapshot. */
+  connectionUpdated(connectionId: string): void {
+    for (const participant of this.store.listParticipantsForScheduling()) {
+      if (participant.connectionId !== connectionId || !participant.enabled) continue;
+      this.clearSchedule(participant.id);
+      if (this.started && !this.stopped) this.schedule(participant.id);
+    }
+  }
+
   schedule(participantId: string, delayOverride?: number | null): void {
     if (!this.started || this.stopped) return;
     const participant = this.store.getParticipant(participantId);
@@ -84,8 +99,9 @@ export class WorkerManager {
   }
 
   private async runCycle(claimed: ClaimedCycle): Promise<void> {
+    let adapter: ParticipantAdapter | undefined;
     try {
-      const adapter = this.options.adapters(claimed.participant, claimed.connection);
+      adapter = this.options.adapters(claimed.participant, claimed.connection);
       if (!adapter) {
         this.store.failCycle({ cycleId: claimed.cycle.id, serverRunId: this.serverRunId, permanent: true, error: "no adapter is available for this participant" });
         this.retryDelays.set(claimed.participant.id, null);
@@ -123,6 +139,7 @@ export class WorkerManager {
       }
     } finally {
       this.controllers.delete(claimed.cycle.id);
+      try { await adapter?.dispose?.(); } catch { /* Child cleanup must not replace a cycle result. */ }
     }
   }
 

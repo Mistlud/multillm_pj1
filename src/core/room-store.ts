@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { assertTokenLimit, countTokens, type TokenCounter } from "./tokens.js";
 import type {
   AddConnectionInput, AddParticipantInput, AppendResInput, Connection, CoreLimits, Cursor, Cycle, CycleSnapshot,
-  FinalAction, ModelInput, Participant, ParticipantDetail, ParticipantRuntime, Post, PublicRes, Room, Thread,
+  FinalAction, ModelInput, Participant, ParticipantDetail, ParticipantMemo, ParticipantRuntime, Post, PublicRes, Room, Thread,
   RuntimeStatus, UpdateConnectionInput, UpdateParticipantInput, UsageRecord, UsageSummary,
 } from "./types.js";
 
@@ -35,6 +35,10 @@ export interface ClaimedCycle {
   input: ModelInput;
 }
 
+export interface DeletedConnection {
+  credentialRefsToCleanup: string[];
+}
+
 interface SqlRow { [key: string]: unknown }
 
 const json = (value: unknown): string => JSON.stringify(value ?? {});
@@ -44,6 +48,19 @@ const parseObject = (value: unknown): Record<string, unknown> => {
     const parsed: unknown = JSON.parse(value);
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch { return {}; }
+};
+const connectionSignature = (value: unknown): { id: string | null; credentialRef: string | null } | null => {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const connection = (parsed as Record<string, unknown>).connection;
+    if (connection === null) return { id: null, credentialRef: null };
+    if (!connection || typeof connection !== "object" || Array.isArray(connection)) return null;
+    const data = connection as Record<string, unknown>;
+    if (typeof data.id !== "string" || !data.id || !("credentialRef" in data) || (data.credentialRef !== null && typeof data.credentialRef !== "string")) return null;
+    return { id: data.id, credentialRef: data.credentialRef as string | null };
+  } catch { return null; }
 };
 const nullableString = (value: unknown): string | null => typeof value === "string" ? value : null;
 const number = (value: unknown): number => Number(value);
@@ -170,15 +187,41 @@ export class RoomStore {
 
   updateConnection(connectionId: string, input: UpdateConnectionInput): Connection {
     const current = this.getConnection(connectionId); if (!current) throw new Error("connection not found");
-    const next = { ...current, ...input, config: input.config ?? current.config, credentialRef: input.credentialRef === undefined ? current.credentialRef : input.credentialRef, updatedAt: this.now() };
+    if (input.type !== undefined && input.type !== current.type) throw new Error("connection type cannot be changed");
+    const next = { ...current, name: input.name ?? current.name, type: current.type, config: input.config === undefined ? current.config : { ...current.config, ...input.config }, credentialRef: input.credentialRef === undefined ? current.credentialRef : input.credentialRef, updatedAt: this.now() };
     if (!next.name.trim() || !next.type.trim()) throw new Error("connection name and type are required");
     this.transaction(() => {
       this.db.prepare("UPDATE connections SET name = ?, type = ?, config_json = ?, credential_ref = ?, updated_at = ? WHERE id = ?").run(next.name, next.type, json(next.config), next.credentialRef, next.updatedAt, connectionId);
-      if (next.type !== current.type || json(next.config) !== json(current.config) || next.credentialRef !== current.credentialRef) {
-        this.db.prepare("UPDATE participant_runtime SET permanent_error = 0, status = CASE WHEN active_cycle_id IS NULL AND (SELECT enabled FROM participants p WHERE p.id = participant_runtime.participant_id) = 1 THEN 'idle' ELSE status END WHERE participant_id IN (SELECT id FROM participants WHERE connection_id = ?)").run(connectionId);
+      if (json(next.config) !== json(current.config) || next.credentialRef !== current.credentialRef) {
+        this.db.prepare("UPDATE participant_runtime SET permanent_error = 0, last_error = NULL, blocked_thread_id = NULL, blocked_res = NULL, blocked_input_signature = NULL, status = CASE WHEN active_cycle_id IS NULL AND (SELECT enabled FROM participants p WHERE p.id = participant_runtime.participant_id) = 1 THEN 'idle' ELSE status END WHERE participant_id IN (SELECT id FROM participants WHERE connection_id = ?)").run(connectionId);
       }
     });
     return next;
+  }
+
+  /** Deletes only an unreferenced Connection; public records and historical usage remain immutable. */
+  deleteConnection(connectionId: string): DeletedConnection {
+    return this.transaction(() => {
+      const current = this.getConnection(connectionId); if (!current) throw new Error("connection not found");
+      if (this.db.prepare("SELECT 1 FROM participants WHERE connection_id = ? LIMIT 1").get(connectionId)) throw new Error("connection is still referenced by a participant");
+      if (this.db.prepare("SELECT 1 FROM usage u JOIN cycles c ON c.id = u.cycle_id WHERE c.status = 'calling' AND u.connection_id = ? LIMIT 1").get(connectionId)) throw new Error("connection is still referenced by an active cycle");
+
+      const candidates = new Set<string>(); if (current.credentialRef) candidates.add(current.credentialRef);
+      const protectedRefs = new Set<string>();
+      for (const row of this.db.prepare("SELECT status, input_signature FROM cycles").all() as SqlRow[]) {
+        const signature = connectionSignature(row.input_signature);
+        if (String(row.status) === "calling") {
+          if (!signature) throw new Error("connection is still referenced by an active cycle");
+          if (signature.id === connectionId) throw new Error("connection is still referenced by an active cycle");
+          if (signature.credentialRef) protectedRefs.add(signature.credentialRef);
+        } else if (signature?.id === connectionId && signature.credentialRef) candidates.add(signature.credentialRef);
+      }
+      for (const row of this.db.prepare("SELECT credential_ref FROM connections WHERE id <> ? AND credential_ref IS NOT NULL").all(connectionId) as SqlRow[]) {
+        const ref = nullableString(row.credential_ref); if (ref) protectedRefs.add(ref);
+      }
+      this.db.prepare("DELETE FROM connections WHERE id = ?").run(connectionId);
+      return { credentialRefsToCleanup: [...candidates].filter((ref) => !protectedRefs.has(ref)) };
+    });
   }
 
   addParticipant(input: AddParticipantInput): ParticipantDetail {
@@ -199,17 +242,22 @@ export class RoomStore {
   }
 
   getParticipant(participantId: string): ParticipantDetail | null {
-    const row = this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id WHERE p.id = ?").get(participantId) as SqlRow | undefined;
+    const row = this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id WHERE p.id = ? AND p.deleted_at IS NULL").get(participantId) as SqlRow | undefined;
     return row ? this.mapParticipantDetail(row) : null;
   }
 
   listParticipants(roomId: string): ParticipantDetail[] {
-    return (this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id WHERE p.room_id = ? ORDER BY p.display_name").all(roomId) as SqlRow[]).map((row) => this.mapParticipantDetail(row));
+    return (this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id WHERE p.room_id = ? AND p.deleted_at IS NULL ORDER BY p.display_name").all(roomId) as SqlRow[]).map((row) => this.mapParticipantDetail(row));
+  }
+
+  /** Management-only read model; includes soft-deleted participants without widening worker input. */
+  listParticipantMemos(roomId: string): ParticipantMemo[] {
+    return (this.db.prepare("SELECT id, display_name, private_memo, updated_at, deleted_at FROM participants WHERE room_id = ? ORDER BY deleted_at IS NOT NULL, display_name").all(roomId) as SqlRow[]).map((row) => ({ participantId: String(row.id), displayName: String(row.display_name), privateMemo: String(row.private_memo), updatedAt: number(row.updated_at), deletedAt: row.deleted_at === null ? null : number(row.deleted_at) }));
   }
 
   /** Scheduler-only view; management metadata stays outside ModelInput. */
   listParticipantsForScheduling(): ParticipantDetail[] {
-    return (this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id ORDER BY p.id").all() as SqlRow[]).map((row) => this.mapParticipantDetail(row));
+    return (this.db.prepare("SELECT p.*, rt.observed_thread_id, rt.observed_res, rt.last_posted_thread_id, rt.last_posted_res, rt.next_poll_at, rt.status, rt.active_cycle_id, rt.last_error, rt.blocked_thread_id, rt.blocked_res, rt.blocked_input_signature, rt.permanent_error FROM participants p JOIN participant_runtime rt ON rt.participant_id = p.id WHERE p.deleted_at IS NULL ORDER BY p.id").all() as SqlRow[]).map((row) => this.mapParticipantDetail(row));
   }
 
   updateParticipant(participantId: string, input: UpdateParticipantInput): ParticipantDetail {
@@ -233,6 +281,17 @@ export class RoomStore {
       if (inputChanged || explicitOffThenOn) this.db.prepare("UPDATE participant_runtime SET permanent_error = 0, status = CASE WHEN active_cycle_id IS NULL AND (SELECT enabled FROM participants p WHERE p.id = participant_runtime.participant_id) = 1 THEN 'idle' ELSE status END WHERE participant_id = ?").run(participantId);
     });
     return this.requireParticipantDetail(participantId);
+  }
+
+  /** Hides a participant while retaining immutable room history, cycles, and usage. */
+  deleteParticipant(participantId: string): void {
+    this.transaction(() => {
+      const participant = this.getParticipant(participantId); if (!participant) throw new Error("participant not found");
+      if (participant.runtime.activeCycleId || this.db.prepare("SELECT 1 FROM cycles WHERE participant_id = ? AND status = 'calling' LIMIT 1").get(participantId)) throw new Error("participant has an active cycle");
+      const now = this.now();
+      this.db.prepare("UPDATE participants SET enabled = 0, connection_id = NULL, deleted_at = ?, updated_at = ? WHERE id = ?").run(now, now, participantId);
+      this.db.prepare("UPDATE participant_runtime SET next_poll_at = NULL, status = 'off' WHERE participant_id = ?").run(participantId);
+    });
   }
 
   /** Atomically checks unread foreign messages and reserves the participant's one active cycle. */
@@ -301,8 +360,9 @@ export class RoomStore {
       if (!row) return false;
       const cycle = this.mapCycle(row); const participant = this.requireParticipantDetail(cycle.participantId); const state = input.status ?? "failed";
       this.db.prepare("UPDATE cycles SET status = ?, completed_at = ?, error = ? WHERE id = ?").run(state, this.now(), input.error, cycle.id);
-      const permanent = Boolean(input.permanent) && cycle.inputSignature === this.inputSignature(participant);
-      this.db.prepare("UPDATE participant_runtime SET active_cycle_id = NULL, status = ?, last_error = ?, blocked_thread_id = ?, blocked_res = ?, blocked_input_signature = ?, permanent_error = ? WHERE participant_id = ? AND active_cycle_id = ?").run(participant.enabled ? (state === "input_blocked" ? "input_blocked" : "error") : "off", input.error, state === "input_blocked" ? cycle.snapshot.threadId : null, state === "input_blocked" ? cycle.snapshot.latestResNumber : null, state === "input_blocked" ? cycle.inputSignature : null, Number(permanent), participant.id, cycle.id);
+      const inputChanged = cycle.inputSignature !== this.inputSignature(participant);
+      const permanent = Boolean(input.permanent) && !inputChanged;
+      this.db.prepare("UPDATE participant_runtime SET active_cycle_id = NULL, status = ?, last_error = ?, blocked_thread_id = ?, blocked_res = ?, blocked_input_signature = ?, permanent_error = ? WHERE participant_id = ? AND active_cycle_id = ?").run(participant.enabled ? (inputChanged ? "idle" : state === "input_blocked" ? "input_blocked" : "error") : "off", inputChanged ? null : input.error, inputChanged || state !== "input_blocked" ? null : cycle.snapshot.threadId, inputChanged || state !== "input_blocked" ? null : cycle.snapshot.latestResNumber, inputChanged || state !== "input_blocked" ? null : cycle.inputSignature, Number(permanent), participant.id, cycle.id);
       return true;
     });
   }
@@ -405,7 +465,7 @@ export class RoomStore {
       CREATE TABLE IF NOT EXISTS res (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 1000), author_type TEXT NOT NULL CHECK(author_type IN ('admin','participant')), author_id TEXT, author_display_name TEXT NOT NULL, body TEXT NOT NULL, post_id INTEGER, generated_from_thread_id TEXT, generated_from_res INTEGER, created_at INTEGER NOT NULL, UNIQUE(thread_id, number));
       CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), author_type TEXT NOT NULL CHECK(author_type IN ('admin','participant')), author_id TEXT, author_display_name TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, config_json TEXT NOT NULL, credential_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), display_name TEXT NOT NULL, avatar TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), connection_id TEXT REFERENCES connections(id), model_id TEXT NOT NULL, model_options_json TEXT NOT NULL, system_prompt TEXT NOT NULL, private_memo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), display_name TEXT NOT NULL, avatar TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), connection_id TEXT REFERENCES connections(id), model_id TEXT NOT NULL, model_options_json TEXT NOT NULL, system_prompt TEXT NOT NULL, private_memo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER);
       CREATE TABLE IF NOT EXISTS participant_runtime (participant_id TEXT PRIMARY KEY REFERENCES participants(id), observed_thread_id TEXT, observed_res INTEGER, last_posted_thread_id TEXT, last_posted_res INTEGER, next_poll_at INTEGER, status TEXT NOT NULL, active_cycle_id TEXT, last_error TEXT, blocked_thread_id TEXT, blocked_res INTEGER, blocked_input_signature TEXT, permanent_error INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cycles (id TEXT PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), room_id TEXT NOT NULL REFERENCES rooms(id), server_run_id TEXT NOT NULL, snapshot_thread_id TEXT NOT NULL, snapshot_thread_number INTEGER NOT NULL, snapshot_res INTEGER NOT NULL, snapshot_post_id INTEGER NOT NULL DEFAULT 0, input_signature TEXT NOT NULL DEFAULT '', observed_thread_id TEXT, observed_res INTEGER, status TEXT NOT NULL, started_at INTEGER NOT NULL, completed_at INTEGER, error TEXT);
       CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), connection_id TEXT, cycle_id TEXT NOT NULL REFERENCES cycles(id), request_id TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_input_tokens INTEGER, provider_usage_json TEXT, created_at INTEGER NOT NULL);
@@ -418,6 +478,7 @@ export class RoomStore {
     `);
     this.ensureColumn("participant_runtime", "blocked_input_signature", "blocked_input_signature TEXT");
     this.ensureColumn("participant_runtime", "permanent_error", "permanent_error INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("participants", "deleted_at", "deleted_at INTEGER");
     this.ensureColumn("cycles", "snapshot_post_id", "snapshot_post_id INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("cycles", "input_signature", "input_signature TEXT NOT NULL DEFAULT ''");
     try { this.db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS res_fts USING fts5(body, author_display_name, res_id UNINDEXED, room_id UNINDEXED)"); this.hasFts5 = true; } catch { this.hasFts5 = false; }
@@ -428,7 +489,7 @@ export class RoomStore {
     const insert = this.db.prepare("INSERT OR IGNORE INTO res_search (res_id, term) VALUES (?, ?)");
     for (const term of searchTerms(`${res.author.displayName} ${res.body}`)) insert.run(res.id, term);
   }
-  private ensureColumn(table: "participant_runtime" | "cycles", column: string, definition: string): void {
+  private ensureColumn(table: "participants" | "participant_runtime" | "cycles", column: string, definition: string): void {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
     if (!columns.some((row) => String(row.name) === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
   }

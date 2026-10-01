@@ -86,6 +86,14 @@ export interface Participant {
   updatedAt: number;
 }
 
+export interface ParticipantMemo {
+  participantId: Id;
+  displayName: string;
+  privateMemo: string;
+  updatedAt: number;
+  deletedAt: number | null;
+}
+
 export interface ParticipantRuntime {
   participantId: Id;
   observed: Cursor | null;
@@ -257,6 +265,7 @@ export interface ParticipantAdapter {
     countInputTokens?: (request: Pick<AdapterRequest, "input" | "history">) => number;
   };
   run(request: AdapterRequest): Promise<ActionResult>;
+  dispose?(): Promise<void> | void;
 }
 
 /** Adapter implementations may expose retry policy without leaking provider errors into the Room. */

@@ -2,6 +2,8 @@ import { GoogleAuth } from 'google-auth-library';
 import type { AdapterRequest, ActionResult, Connection, ParticipantAdapter, AdapterResolver, AdapterUsage } from '../core/index.js';
 import { AdapterError as CoreAdapterError } from '../core/index.js';
 import type { CredentialStore } from '../server/credentials.js';
+import type { CodexManagerLike } from '../server/codex.js';
+import { CodexAdapter } from './codex.js';
 
 export const ACTION_SCHEMA = {
   type: 'OBJECT', required: ['action'], properties: {
@@ -129,19 +131,21 @@ class CompatibleAdapter implements ParticipantAdapter {
   }
 }
 
-export function createAdapterResolver(credentials: CredentialStore): AdapterResolver {
+export function createAdapterResolver(credentials: CredentialStore, options: { codexManager?: CodexManagerLike } = {}): AdapterResolver {
   return (participant, connection) => {
     if (!connection) return undefined;
     let adapter: ParticipantAdapter;
     if (connection.type === 'mock') adapter = new MockAdapter();
     else if (connection.type === 'vertex') adapter = new VertexAdapter(connection, credentials);
     else if (connection.type === 'oai-compatible' || connection.type === 'custom-api') adapter = new CompatibleAdapter(connection, credentials);
+    else if (connection.type === 'codex' && options.codexManager) adapter = new CodexAdapter(connection, options.codexManager);
     else return undefined;
     const context = connection.type === 'vertex' && participant.modelId === 'gemini-3.8-flash' ? 1_048_576 : Number(participant.modelOptions.contextTokens ?? connection.config.contextTokens ?? (connection.type === 'mock' ? 64_000 : 0));
-    const reserve = Number(participant.modelOptions.outputTokens ?? 4096);
+    const reserve = connection.type === 'codex' ? 4096 : Number(participant.modelOptions.outputTokens ?? 4096);
     return {
       inputBudget: { maxInputTokens: Number.isFinite(context) ? context : 0, outputReserveTokens: Number.isFinite(reserve) ? reserve + 1024 : 4096, countInputTokens(request) { const prompt = buildPrompts(request); return Buffer.byteLength(prompt.system + prompt.user, 'utf8'); } },
       run: (request) => adapter.run(request),
+      dispose: () => adapter.dispose?.(),
     };
   };
 }

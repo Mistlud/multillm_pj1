@@ -8,7 +8,11 @@ const lock = join(config.dataDir, 'server-lock.json');
 if (existsSync(lock)) {
   const previous = JSON.parse(readFileSync(lock, 'utf8')) as { pid: number };
   let alive = true;
-  try { process.kill(previous.pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') alive = false; }
+  try { process.kill(previous.pid, 0); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') alive = false;
+    else throw new Error(`이전 서버 PID ${previous.pid}의 실행 여부를 확인하지 못했습니다 (${code ?? 'unknown'}). 서버 종료를 확인한 뒤 ${lock} 잠금 파일을 정리하세요.`);
+  }
   if (alive) throw new Error('이 데이터 폴더의 서버가 이미 실행 중입니다.');
   unlinkSync(lock);
 }

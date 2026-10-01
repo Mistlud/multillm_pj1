@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -21,6 +21,12 @@ export class CredentialStore {
     const path = join(this.dir, `${id}.dpapi`);
     if (!existsSync(path)) throw new Error('Credential not found');
     return this.protect(readFileSync(path, 'utf8'), true);
+  }
+  /** Removes only a credential created for a request that could not be committed. */
+  delete(id: string): void {
+    if (!/^[0-9a-f-]{36}$/.test(id)) return;
+    const path = join(this.dir, `${id}.dpapi`);
+    if (existsSync(path)) unlinkSync(path);
   }
   private async protect(value: string, decrypt: boolean): Promise<string> {
     const code = `Add-Type -AssemblyName System.Security; $value=[Console]::In.ReadToEnd(); $bytes=[Convert]::FromBase64String($value); $result=[Security.Cryptography.ProtectedData]::${decrypt ? 'Unprotect' : 'Protect'}($bytes,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($result));`;

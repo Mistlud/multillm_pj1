@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { RoomStore } from "../src/core/index.js";
 
 function store(limits: Record<string, number> = {}) {
@@ -50,4 +54,36 @@ test("public append enforces author identity and room membership", () => {
   const saved = db.appendRes({ roomId: one.id, author: { type: "participant", id: participant.id, displayName: "spoofed" }, body: "x" });
   assert.equal(saved.author.displayName, "A");
   db.close();
+});
+
+test("participant deletion migration preserves legacy data and remains deleted after reopening", () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "llm-room-participant-migration-"));
+  const path = join(dataDir, "room.sqlite");
+  let db: RoomStore | undefined;
+  try {
+    db = RoomStore.open({ path });
+    const room = db.createRoom({ name: "legacy room" });
+    const connection = db.addConnection({ name: "legacy mock", type: "mock" });
+    const participant = db.addParticipant({ roomId: room.id, displayName: "legacy", modelId: "mock", connectionId: connection.id, privateMemo: "legacy memo", systemPrompt: "legacy prompt" });
+    db.appendRes({ roomId: room.id, author: { type: "participant", id: participant.id, displayName: "legacy" }, body: "legacy message" });
+    db.close(); db = undefined;
+    const fixtureDb = new DatabaseSync(path);
+    try { fixtureDb.exec("ALTER TABLE participants DROP COLUMN deleted_at"); }
+    finally { fixtureDb.close(); }
+    db = RoomStore.open({ path });
+    const restored = db.getParticipant(participant.id)!;
+    assert.equal(restored.displayName, "legacy"); assert.equal(restored.privateMemo, "legacy memo");
+    assert.equal(restored.systemPrompt, "legacy prompt"); assert.equal(restored.connectionId, connection.id);
+    assert.equal(db.listThreadRes(db.getCurrentThread(room.id)!.id)[0]!.body, "legacy message");
+    db.deleteParticipant(participant.id); db.close(); db = undefined;
+    db = RoomStore.open({ path });
+    assert.equal(db.getParticipant(participant.id), null);
+    assert.deepEqual(db.listParticipants(room.id), []);
+    assert.deepEqual(db.listParticipantsForScheduling(), []);
+    assert.equal(db.listThreadRes(db.getCurrentThread(room.id)!.id)[0]!.author.displayName, "legacy");
+    assert.deepEqual(db.deleteConnection(connection.id).credentialRefsToCleanup, []);
+    const auditDb = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal(auditDb.prepare("SELECT private_memo FROM participants WHERE id = ?").get(participant.id)!.private_memo, "legacy memo"); }
+    finally { auditDb.close(); }
+  } finally { db?.close(); rmSync(dataDir, { recursive: true, force: true }); }
 });

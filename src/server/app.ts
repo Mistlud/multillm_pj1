@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { RoomStore, WorkerManager, type Connection, type UpdateParticipantInput } from '../core/index.js';
 import { CredentialStore } from './credentials.js';
 import { createAdapterResolver } from '../adapters/index.js';
+import { CodexManager, type CodexManagerLike } from './codex.js';
 import type { AppConfig } from './config.js';
 
 class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -30,18 +31,56 @@ async function body(req: IncomingMessage): Promise<Record<string, any>> {
 }
 function json(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); }
 function safeConnection(connection: Connection) { const { credentialRef, ...rest } = connection; return { ...rest, hasCredential: Boolean(credentialRef) }; }
+const connectionTypes = new Set(['mock', 'vertex', 'oai-compatible', 'custom-api', 'codex']);
 
-export function createApp(config: AppConfig, options: { store?: RoomStore; onShutdown?: () => void } = {}) {
+function connectionValues(input: Record<string, any>, current?: Connection): { name: string; type: string; config: Record<string, unknown>; credential?: string } {
+  const type = current ? current.type : string(input.type, '연결 유형');
+  if (!connectionTypes.has(type)) throw new HttpError(400, '아직 지원하지 않는 연결 유형입니다.');
+  if (current && 'type' in input && string(input.type, '연결 유형') !== current.type) throw new HttpError(400, 'Connection 유형은 수정할 수 없습니다.');
+  const name = current && !('name' in input) ? current.name : string(input.name, '연결 이름');
+  const configPatch = 'config' in input ? record(input.config) : {};
+  const source = { ...(current?.config ?? {}), ...configPatch };
+  const config: Record<string, unknown> = {};
+  if (type === 'vertex') {
+    config.project = string(source.project, 'GCP project');
+    config.location = string(source.location ?? 'global', 'location');
+    config.contextTokens = Number(source.contextTokens ?? 1048576);
+  } else if (type === 'oai-compatible' || type === 'custom-api') {
+    config.endpoint = string(source.endpoint, 'endpoint', 2000);
+    config.contextTokens = Number(source.contextTokens);
+    if ('jsonMode' in source && typeof source.jsonMode !== 'boolean') throw new HttpError(400, 'jsonMode 값을 확인하세요.');
+    config.jsonMode = source.jsonMode ?? true;
+  } else if (type === 'codex') {
+    config.contextTokens = Number(source.contextTokens ?? 64_000);
+  }
+  if (type !== 'mock' && (!Number.isInteger(config.contextTokens) || Number(config.contextTokens) < 1024 || Number(config.contextTokens) > 2_000_000)) throw new HttpError(400, 'contextTokens 입력 한도를 확인하세요.');
+  let credential: string | undefined;
+  if ('credential' in input) {
+    if (typeof input.credential !== 'string') throw new HttpError(400, '인증정보 값을 확인하세요.');
+    if (input.credential.trim()) credential = string(input.credential, '인증정보', 100000);
+  }
+  if (credential && (type === 'mock' || type === 'codex')) throw new HttpError(400, type === 'codex' ? 'Codex Connection은 ChatGPT 구독 인증만 사용합니다.' : 'Mock Connection에는 인증정보를 저장할 수 없습니다.');
+  if (credential && type === 'vertex') {
+    let key: Record<string, any>;
+    try { key = record(JSON.parse(credential)); } catch { throw new HttpError(400, '서비스 계정 JSON 형식을 확인하세요.'); }
+    if (key.type !== 'service_account' || !key.client_email || !key.private_key) throw new HttpError(400, '서비스 계정 JSON이 필요합니다.');
+  }
+  if (type === 'vertex' && !credential && !current?.credentialRef) throw new HttpError(400, '서비스 계정 JSON 인증이 필요합니다.');
+  return { name, type, config, credential };
+}
+
+export function createApp(config: AppConfig, options: { store?: RoomStore; onShutdown?: () => void; codexManager?: CodexManagerLike } = {}) {
   const store = options.store ?? RoomStore.open({ path: resolve(config.dataDir, 'room.sqlite') });
   const credentials = new CredentialStore(config.dataDir);
-  const workers = new WorkerManager(store, { adapters: createAdapterResolver(credentials) });
+  let workers: WorkerManager;
+  const codex = options.codexManager ?? new CodexManager(config.dataDir, { onLoginComplete: (connectionId) => workers.connectionUpdated(connectionId) });
+  workers = new WorkerManager(store, { adapters: createAdapterResolver(credentials, { codexManager: codex }) });
   const room = store.getRoom('main') ?? store.createRoom({ id: 'main', name: 'LLM 단톡방' });
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; until: number }>();
   let closing = false;
   const addresses = Object.values(networkInterfaces()).flatMap((entries) => entries ?? []).filter((entry) => entry.family === 'IPv4' && !entry.internal).map((entry) => entry.address);
   const allowedHosts = new Set(['localhost', '127.0.0.1', '[::1]', ...addresses, config.host]);
-  const apiTypes = new Set(['mock', 'vertex', 'oai-compatible', 'custom-api']);
   const validHost = (req: IncomingMessage): boolean => { try { return allowedHosts.has(new URL(`http://${req.headers.host}`).hostname); } catch { return false; } };
   const originValid = (req: IncomingMessage): boolean => !req.headers.origin || req.headers.origin === `http://${req.headers.host}`;
   const authenticated = (req: IncomingMessage): boolean => {
@@ -61,7 +100,7 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       if (!validHost(req)) throw new HttpError(403, '허용되지 않은 서버 주소입니다.');
       const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
       const method = req.method ?? 'GET';
-      if (!['GET', 'POST', 'PATCH'].includes(method)) throw new HttpError(405, '지원하지 않는 요청 방식입니다.');
+      if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) throw new HttpError(405, '지원하지 않는 요청 방식입니다.');
       if (method !== 'GET' && (!originValid(req) || req.headers['sec-fetch-site'] === 'cross-site')) throw new HttpError(403, '다른 사이트에서 보낸 요청은 허용하지 않습니다.');
       if (method === 'GET' && ['/','/app.js','/style.css'].includes(url.pathname)) {
         const asset = url.pathname === '/' ? ['public/index.html', 'text/html'] : url.pathname === '/style.css' ? ['public/style.css', 'text/css'] : ['dist/web/app.js', 'text/javascript'];
@@ -92,7 +131,7 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       }
       if (url.pathname === '/api/state' && method === 'GET') {
         const current = store.getCurrentThread(room.id)!;
-        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
+        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
       }
       if (url.pathname === '/api/res' && method === 'POST') {
         const input = await body(req); const message = string(input.message, '메시지', 20000);
@@ -110,25 +149,70 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       }
       if (url.pathname === '/api/archive' && method === 'GET') { const query = url.searchParams.get('q') ?? ''; if (query.length > 300) throw new HttpError(400, '검색어가 너무 깁니다.'); json(res, 200, store.searchArchive(room.id, query)); return; }
       if (url.pathname === '/api/connections' && method === 'POST') {
-        const input = await body(req); const type = string(input.type, '연결 유형');
-        if (!apiTypes.has(type)) throw new HttpError(400, '아직 지원하지 않는 연결 유형입니다.');
-        const cfg = record(input.config ?? {}); const safeConfig: Record<string, unknown> = {};
-        if (type === 'vertex') { safeConfig.project = string(cfg.project, 'GCP project'); safeConfig.location = string(cfg.location ?? 'global', 'location'); safeConfig.contextTokens = Number(cfg.contextTokens ?? 1048576); }
-        if (type === 'oai-compatible' || type === 'custom-api') { safeConfig.endpoint = string(cfg.endpoint, 'endpoint', 2000); safeConfig.contextTokens = Number(cfg.contextTokens); safeConfig.jsonMode = cfg.jsonMode !== false; }
-        if (type !== 'mock' && (!Number.isInteger(safeConfig.contextTokens) || Number(safeConfig.contextTokens) < 1024 || Number(safeConfig.contextTokens) > 2_000_000)) throw new HttpError(400, 'contextTokens 입력 한도를 확인하세요.');
+        const input = await body(req); const values = connectionValues(input);
         let credentialRef: string | null = null;
-        if (input.credential) {
-          const secret = string(input.credential, '인증정보', 100000);
-          if (type === 'vertex') { let key: Record<string, any>; try { key = record(JSON.parse(secret)); } catch { throw new HttpError(400, '서비스 계정 JSON 형식을 확인하세요.'); } if (key.type !== 'service_account' || !key.client_email || !key.private_key) throw new HttpError(400, '서비스 계정 JSON이 필요합니다.'); }
-          credentialRef = await credentials.save(secret);
+        let created: Connection;
+        try {
+          if (values.credential) credentialRef = await credentials.save(values.credential);
+          created = store.addConnection({ name: values.name, type: values.type, config: values.config, credentialRef });
+        } catch (error) {
+          if (credentialRef) credentials.delete(credentialRef);
+          throw error;
         }
-        if (type === 'vertex' && !credentialRef) throw new HttpError(400, '서비스 계정 JSON 인증이 필요합니다.');
-        json(res, 201, safeConnection(store.addConnection({ name: string(input.name, '연결 이름'), type, config: safeConfig, credentialRef }))); return;
+        json(res, 201, safeConnection(created)); return;
+      }
+      const codexRoute = /^\/api\/connections\/([^/]+)\/codex\/(status|login|cancel)$/.exec(url.pathname);
+      if (codexRoute) {
+        const id = codexRoute[1]!; const action = codexRoute[2]!; const connection = store.getConnection(id);
+        if (!connection) throw new HttpError(404, 'Connection이 없습니다.');
+        if (connection.type !== 'codex') throw new HttpError(400, 'Codex Connection이 아닙니다.');
+        if (action === 'status' && method === 'GET') { json(res, 200, await codex.checkStatus(connection)); return; }
+        if (action === 'login' && method === 'POST') { await body(req); try { json(res, 200, await codex.startLogin(connection)); } catch (error) { throw new HttpError(400, error instanceof Error ? error.message : 'Codex 인증을 시작하지 못했습니다.'); } return; }
+        if (action === 'cancel' && method === 'POST') { await body(req); await codex.cancelLogin(connection.id); json(res, 200, { ok: true }); return; }
+      }
+      if (url.pathname.startsWith('/api/connections/') && method === 'PATCH') {
+        const id = url.pathname.split('/').at(-1)!; const input = await body(req); const current = store.getConnection(id);
+        if (!current) throw new HttpError(404, 'Connection이 없습니다.');
+        const values = connectionValues(input, current);
+        let credentialRef: string | undefined;
+        let updated: Connection;
+        let settingsChanged = false;
+        try {
+          if (values.credential) credentialRef = await credentials.save(values.credential);
+          const latest = store.getConnection(id);
+          if (!latest) throw new HttpError(404, 'Connection이 없습니다.');
+          const committed = connectionValues(input, latest);
+          updated = store.updateConnection(id, { name: 'name' in input ? committed.name : undefined, type: latest.type, config: 'config' in input ? committed.config : undefined, credentialRef });
+          settingsChanged = JSON.stringify(updated.config) !== JSON.stringify(latest.config) || updated.credentialRef !== latest.credentialRef;
+        } catch (error) {
+          if (credentialRef) credentials.delete(credentialRef);
+          throw error;
+        }
+        if (settingsChanged) workers.connectionUpdated(id);
+        json(res, 200, safeConnection(updated)); return;
+      }
+      if (url.pathname.startsWith('/api/connections/') && method === 'DELETE') {
+        const id = url.pathname.split('/').at(-1)!;
+        const connection = store.getConnection(id);
+        let deleted: ReturnType<RoomStore["deleteConnection"]>;
+        try { deleted = store.deleteConnection(id); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : '';
+          if (/still referenced/.test(message)) throw new HttpError(409, '참가자 또는 진행 중 호출에서 사용하는 Connection은 삭제할 수 없습니다.');
+          if (/not found/.test(message)) throw new HttpError(404, 'Connection이 없습니다.');
+          throw error;
+        }
+        let cleanupWarning = false;
+        for (const ref of deleted.credentialRefsToCleanup) {
+          try { credentials.delete(ref); } catch { cleanupWarning = true; }
+        }
+        if (connection?.type === 'codex') { try { await codex.remove(connection); } catch { cleanupWarning = true; } }
+        json(res, 200, { ok: true, cleanupWarning }); return;
       }
       if (url.pathname === '/api/participants' && method === 'POST') {
         const input = await body(req); const options = record(input.modelOptions ?? {});
-        const connectionId = string(input.connectionId, 'Connection'); if (!store.getConnection(connectionId)) throw new HttpError(400, 'Connection이 없습니다.');
-        validateOptions(options);
+        const connectionId = string(input.connectionId, 'Connection'); const connection = store.getConnection(connectionId); if (!connection) throw new HttpError(400, 'Connection이 없습니다.');
+        validateOptions(options, connection);
         const participant = store.addParticipant({ roomId: room.id, displayName: string(input.displayName, '표시 이름', 80), modelId: string(input.modelId, '모델 ID'), connectionId, enabled: false, systemPrompt: typeof input.systemPrompt === 'string' ? input.systemPrompt.slice(0, 20000) : '', modelOptions: options });
         json(res, 201, participant); return;
       }
@@ -138,13 +222,26 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
         const patch: UpdateParticipantInput = {};
         if ('displayName' in input) patch.displayName = string(input.displayName, '표시 이름', 80);
         if ('modelId' in input) patch.modelId = string(input.modelId, '모델 ID');
-        if ('connectionId' in input) { patch.connectionId = string(input.connectionId, 'Connection'); if (!store.getConnection(patch.connectionId)) throw new HttpError(400, 'Connection이 없습니다.'); }
+        const requestedConnection = 'connectionId' in input ? store.getConnection(string(input.connectionId, 'Connection')) : store.getConnection(participant.connectionId ?? '');
+        if ('connectionId' in input) { patch.connectionId = string(input.connectionId, 'Connection'); if (!requestedConnection) throw new HttpError(400, 'Connection이 없습니다.'); }
         if ('systemPrompt' in input) { if (typeof input.systemPrompt !== 'string' || input.systemPrompt.length > 20000) throw new HttpError(400, 'system prompt를 확인하세요.'); patch.systemPrompt = input.systemPrompt; }
-        if ('modelOptions' in input) { patch.modelOptions = record(input.modelOptions); validateOptions(patch.modelOptions); }
+        if ('modelOptions' in input) { patch.modelOptions = record(input.modelOptions); validateOptions(patch.modelOptions, requestedConnection ?? undefined); }
+        else if ('connectionId' in input) validateOptions(participant.modelOptions, requestedConnection ?? undefined);
         if (Object.keys(patch).length) store.updateParticipant(id, patch);
         if ('enabled' in input) { if (typeof input.enabled !== 'boolean') throw new HttpError(400, 'enabled는 boolean이어야 합니다.'); workers.setEnabled(id, input.enabled); }
         else if (participant.enabled) workers.schedule(id);
         json(res, 200, store.getParticipant(id)); return;
+      }
+      if (url.pathname.startsWith('/api/participants/') && method === 'DELETE') {
+        const id = url.pathname.split('/').at(-1)!; const participant = store.getParticipant(id);
+        if (!participant || participant.roomId !== room.id) throw new HttpError(404, '참가자가 없습니다.');
+        try { store.deleteParticipant(id); }
+        catch (error) {
+          if (error instanceof Error && /active cycle/.test(error.message)) throw new HttpError(409, '진행 중인 호출이 있어 참가자를 삭제할 수 없습니다.');
+          throw error;
+        }
+        workers.removeParticipant(id);
+        json(res, 200, { ok: true }); return;
       }
       if (url.pathname === '/api/shutdown' && method === 'POST') { json(res, 200, { ok: true }); setImmediate(() => { shutdown(); options.onShutdown?.(); }); return; }
       throw new HttpError(404, '요청한 경로가 없습니다.');
@@ -158,17 +255,21 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       }
     }
   });
-  function shutdown(): void { if (closing) return; closing = true; workers.stop(); server.close(); server.closeAllConnections(); }
-  server.on('close', () => { workers.stop(); if (!options.store) store.close(); });
+  function shutdown(): void { if (closing) return; closing = true; workers.stop(); void codex.stop(); server.close(); server.closeAllConnections(); }
+  server.on('close', () => { workers.stop(); void codex.stop(); if (!options.store) store.close(); });
   server.requestTimeout = 30000; server.headersTimeout = 10000;
   return { server, store, workers, room, shutdown, startWorkers: () => workers.start() };
 }
 
-function validateOptions(options: Record<string, unknown>) {
-  const allowed = new Set(['outputTokens', 'contextTokens', 'thinkingLevel', 'mockAction']);
+function validateOptions(options: Record<string, unknown>, connection?: Connection) {
+  const allowed = new Set(['outputTokens', 'contextTokens', 'thinkingLevel', 'mockAction', 'reasoningEffort']);
   if (Object.keys(options).some((key) => !allowed.has(key))) throw new HttpError(400, '지원하지 않는 모델 옵션입니다.');
   if ('outputTokens' in options && (!Number.isInteger(options.outputTokens) || Number(options.outputTokens) < 256 || Number(options.outputTokens) > 32768)) throw new HttpError(400, 'outputTokens는 256~32768이어야 합니다.');
   if ('contextTokens' in options && (!Number.isInteger(options.contextTokens) || Number(options.contextTokens) < 1024 || Number(options.contextTokens) > 2_000_000)) throw new HttpError(400, 'contextTokens를 확인하세요.');
   if ('thinkingLevel' in options && !['LOW','MEDIUM','HIGH'].includes(String(options.thinkingLevel))) throw new HttpError(400, 'thinkingLevel을 확인하세요.');
   if ('mockAction' in options && !['wait','reply'].includes(String(options.mockAction))) throw new HttpError(400, 'mockAction을 확인하세요.');
+  if ('reasoningEffort' in options && !['minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(options.reasoningEffort))) throw new HttpError(400, 'reasoningEffort를 확인하세요.');
+  if (connection?.type === 'codex') {
+    if ('outputTokens' in options || 'contextTokens' in options || 'thinkingLevel' in options || 'mockAction' in options) throw new HttpError(400, 'Codex는 reasoningEffort만 지원합니다.');
+  } else if ('reasoningEffort' in options) throw new HttpError(400, 'reasoningEffort는 Codex Connection에서만 지원합니다.');
 }

@@ -116,3 +116,120 @@ test("OFF preserves a running cycle result but server stop rejects late output a
   assert.equal(db.getParticipant(participant.id)!.runtime.status, "idle");
   db.close();
 });
+
+test("connection budget edits recheck blocked input and keep participant identity and memo", async () => {
+  const db = makeStore({ outputReserveTokens: 0 });
+  const room = db.createRoom({ name: "room" });
+  const connection = db.addConnection({ name: "shared", type: "fake", config: { contextTokens: 1 } });
+  const participant = db.addParticipant({ roomId: room.id, displayName: "A", modelId: "fake", connectionId: connection.id, privateMemo: "keep me" });
+  db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "관리자" }, body: "hello" });
+  let calls = 0;
+  const manager = new WorkerManager(db, { adapters: (_participant, current) => ({ inputBudget: { maxInputTokens: Number(current!.config.contextTokens), outputReserveTokens: 0, countInputTokens: () => 2 }, run: async () => { calls++; return { action: { action: "wait" } }; } }) });
+  try {
+    await manager.pollNow(participant.id);
+    await manager.pollNow(participant.id);
+    assert.equal(calls, 0);
+    assert.equal(db.getParticipant(participant.id)!.runtime.status, "input_blocked");
+    db.updateConnection(connection.id, { config: { contextTokens: 1024 } });
+    await manager.pollNow(participant.id);
+    assert.equal(calls, 1);
+    const after = db.getParticipant(participant.id)!;
+    assert.equal(after.displayName, "A");
+    assert.equal(after.privateMemo, "keep me");
+    assert.equal(after.connectionId, connection.id);
+    assert.equal(after.runtime.status, "idle");
+  } finally { manager.stop(); db.close(); }
+});
+
+for (const inputBlocked of [false, true]) {
+  test(`connection replacement recovers after an old in-flight ${inputBlocked ? "input-blocked" : "permanent"} error`, async () => {
+    const db = makeStore(); const room = db.createRoom({ name: "room" });
+    const connection = db.addConnection({ name: "shared", type: "fake", credentialRef: "old-key" });
+    const participant = db.addParticipant({ roomId: room.id, displayName: "A", modelId: "fake", connectionId: connection.id, privateMemo: "keep me" });
+    db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "관리자" }, body: "hello" });
+    let rejectOld: ((error: Error) => void) | undefined;
+    const seen: string[] = [];
+    const manager = new WorkerManager(db, { adapters: (_participant, current) => {
+      seen.push(current!.credentialRef!);
+      return { run: () => current!.credentialRef === "old-key" ? new Promise((_resolve, reject) => { rejectOld = reject; }) : Promise.resolve({ action: { action: "wait" } }) };
+    } });
+    try {
+      manager.start();
+      const oldCycle = manager.pollNow(participant.id);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(seen, ["old-key"]);
+      db.updateConnection(connection.id, { credentialRef: "new-key" });
+      await manager.pollNow(participant.id);
+      assert.deepEqual(seen, ["old-key"]);
+      rejectOld!(new AdapterError("old setting rejected", { permanent: !inputBlocked, inputBlocked }));
+      await oldCycle;
+      const afterFailure = db.getParticipant(participant.id)!;
+      assert.equal(afterFailure.runtime.permanentError, false);
+      assert.notEqual(afterFailure.runtime.nextPollAt, null);
+      assert.equal(afterFailure.runtime.observed, null);
+      await manager.pollNow(participant.id);
+      assert.deepEqual(seen, ["old-key", "new-key"]);
+      assert.equal(db.getParticipant(participant.id)!.runtime.status, "idle");
+      assert.equal(db.getParticipant(participant.id)!.privateMemo, "keep me");
+    } finally { manager.stop(); db.close(); }
+  });
+}
+
+test("connection edits leave the running cycle snapshot intact and affect the next cycle", async () => {
+  const db = makeStore(); const room = db.createRoom({ name: "room" });
+  const connection = db.addConnection({ name: "shared", type: "fake", credentialRef: "old-key" });
+  const participant = db.addParticipant({ roomId: room.id, displayName: "A", modelId: "fake", connectionId: connection.id });
+  db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "관리자" }, body: "first" });
+  let finishOld: ((value: { action: unknown }) => void) | undefined;
+  const seen: string[] = [];
+  const manager = new WorkerManager(db, { adapters: (_participant, current) => {
+    seen.push(current!.credentialRef!);
+    return { run: () => current!.credentialRef === "old-key" ? new Promise((resolve) => { finishOld = resolve; }) : Promise.resolve({ action: { action: "wait" } }) };
+  } });
+  try {
+    const oldCycle = manager.pollNow(participant.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    db.updateConnection(connection.id, { credentialRef: "new-key" });
+    db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "관리자" }, body: "during generation" });
+    await manager.pollNow(participant.id);
+    assert.deepEqual(seen, ["old-key"]);
+    finishOld!({ action: { action: "reply", message: "old result" } }); await oldCycle;
+    assert.equal(db.getParticipant(participant.id)!.runtime.observed!.resNumber, 1);
+    assert.equal(db.listThreadRes(db.getCurrentThread(room.id)!.id).at(-1)!.body, "old result");
+    await manager.pollNow(participant.id);
+    assert.deepEqual(seen, ["old-key", "new-key"]);
+    assert.equal(db.getParticipant(participant.id)!.runtime.observed!.resNumber, 3);
+  } finally { manager.stop(); db.close(); }
+});
+
+test("participant deletion cancels polling and prevents reactivation or scheduling after restart", async () => {
+  const { db, room, participant } = await setup();
+  db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "관리자" }, body: "hello" });
+  const timers: Array<{ callback: () => void; delay: number }> = [];
+  const cancelled = new Set<unknown>(); let calls = 0;
+  const options = {
+    adapters: () => ({ run: async () => { calls++; return { action: { action: "wait" } }; } }),
+    setTimer: (callback: () => void, delay: number) => { const timer = { callback, delay }; timers.push(timer); return timer as unknown as ReturnType<typeof setTimeout>; },
+    clearTimer: (timer: ReturnType<typeof setTimeout>) => { cancelled.add(timer); },
+  };
+  const manager = new WorkerManager(db, options);
+  let restarted: WorkerManager | undefined;
+  try {
+    manager.start();
+    assert.equal(timers.length, 1);
+    db.deleteParticipant(participant.id); manager.removeParticipant(participant.id);
+    assert.equal(cancelled.has(timers[0]), true);
+    timers[0]!.callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.pollNow(participant.id);
+    assert.equal(calls, 0);
+    assert.equal(db.claimCycle({ participantId: participant.id, serverRunId: manager.serverRunId }), null);
+    assert.throws(() => manager.setEnabled(participant.id, true), /not found/);
+    assert.throws(() => db.updateParticipant(participant.id, { displayName: "revive" }), /not found/);
+    manager.stop();
+    restarted = new WorkerManager(db, options); restarted.start();
+    assert.equal(timers.length, 1);
+    assert.deepEqual(db.listParticipantsForScheduling(), []);
+    assert.equal(db.getUsageSummary().calls, 0);
+  } finally { restarted?.stop(); manager.stop(); db.close(); }
+});
