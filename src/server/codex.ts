@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import type { Connection } from '../core/index.js';
+import { sanitizeError } from '../core/redaction.js';
 
 const DISABLED_FEATURES = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'remote_plugin', 'hooks', 'memories', 'multi_agent', 'browser_use', 'browser_use_external', 'browser_use_full_cdp_access', 'computer_use', 'view_image', 'image_generation', 'workspace_dependencies', 'goals', 'sleep_tool', 'skill_search', 'skill_mcp_dependency_install', 'code_mode_host', 'shell_snapshot', 'guardian_approval', 'auth_elicitation', 'realtime_conversation', 'in_app_local_automation'];
 const BUNDLED_SKILLS = ['imagegen', 'openai-docs', 'skill-creator', 'skill-installer', 'review-agent'];
@@ -22,10 +23,11 @@ export interface CodexManagerOptions {
   resolveCommand?: () => Command | undefined;
   versionCheck?: (command: Command) => Promise<boolean>;
   onLoginComplete?: (connectionId: string) => void;
+  onAuthError?: (connectionId: string, error: unknown) => void;
 }
 export interface CodexStatus { available: boolean; authenticated: boolean; busy: boolean; message?: string; }
 export interface CodexCycle {
-  turn(input: string, effort: string): Promise<{ text: string; usage?: Record<string, unknown> }>;
+  turn(input: string, effort?: string): Promise<{ text: string; usage?: Record<string, unknown> }>;
   dispose(): Promise<void>;
 }
 export interface CodexManagerLike {
@@ -71,7 +73,7 @@ class RpcProcess {
       this.write({ id, method, params });
     });
   }
-  async turn(threadId: string, input: string, effort: string): Promise<{ text: string; usage?: Record<string, unknown> }> {
+  async turn(threadId: string, input: string, effort?: string): Promise<{ text: string; usage?: Record<string, unknown> }> {
     if (this.closed || this.turnWaiter) throw new Error('Codex turn을 시작할 수 없습니다.');
     this.text = ''; this.usage = undefined;
     const done = new Promise<void>((resolve, reject) => {
@@ -81,7 +83,7 @@ class RpcProcess {
     // Completion can arrive before the turn/start reply; rejection must also be observed immediately.
     void done.catch(() => undefined);
     try {
-      await this.call('turn/start', { threadId, input: [{ type: 'text', text: input }], effort, environments: [], runtimeWorkspaceRoots: [] });
+      await this.call('turn/start', { threadId, input: [{ type: 'text', text: input }], ...(effort === undefined ? {} : { effort }), environments: [], runtimeWorkspaceRoots: [] });
       await done;
       return { text: this.text, usage: this.usage };
     } catch (error) { this.close(); throw error; }
@@ -117,7 +119,7 @@ class RpcProcess {
       const pending = this.pending.get(value.id);
       if (pending) {
         clearTimeout(pending.timer); this.pending.delete(value.id);
-        if (value.error) pending.reject(new Error('Codex 요청에 실패했습니다. 인증·모델·할당량을 확인하세요.'));
+        if (value.error) { const details = sanitizeError(value.error); pending.reject(Object.assign(new Error(details.message ?? 'Codex 요청에 실패했습니다.'), { details, providerCode: String(details.code ?? '') })); }
         else pending.resolve(value.result);
       }
       return;
@@ -134,7 +136,7 @@ class RpcProcess {
     if (method === 'turn/completed' && params.threadId === this.turnWaiter?.threadId) {
       const waiter = this.turnWaiter!; clearTimeout(waiter.timer); this.turnWaiter = undefined;
       if (params.turn?.status === 'completed') waiter.resolve(undefined);
-      else waiter.reject(new Error('Codex 응답이 완료되지 않았습니다. 인증·모델·할당량을 확인하세요.'));
+      else { const details = sanitizeError(params.turn?.error); waiter.reject(Object.assign(new Error(details?.message ?? 'Codex 응답이 완료되지 않았습니다.'), { details, usage: this.usage, providerCode: details?.codexErrorInfo ? JSON.stringify(details.codexErrorInfo) : undefined })); }
     }
   }
 }
@@ -206,7 +208,7 @@ export class CodexManager implements CodexManagerLike {
         const account = await rpc.call('account/read', {});
         if (epoch === this.loginEpoch.get(connection.id)) this.statuses.set(connection.id, { available: true, authenticated: account?.account?.type === 'chatgpt', busy: false });
       } catch (error) {
-        if (epoch === this.loginEpoch.get(connection.id)) this.statuses.set(connection.id, { available: false, authenticated: false, busy: false, message: error instanceof Error ? error.message : 'Codex 상태를 확인하지 못했습니다.' });
+        if (epoch === this.loginEpoch.get(connection.id)) { const message = sanitizeError(error instanceof Error ? error.message : 'Codex 상태를 확인하지 못했습니다.'); const changed = this.status(connection.id).message !== message; this.statuses.set(connection.id, { available: false, authenticated: false, busy: false, message }); if (changed) this.options.onAuthError?.(connection.id, error); }
       } finally { rpc?.close(); if (rpc) await rpc.waitForExit(); this.checkedAt.set(connection.id, Date.now()); this.checking.delete(connection.id); }
       return this.status(connection.id);
     })();
@@ -264,7 +266,7 @@ export class CodexManager implements CodexManagerLike {
       this.statuses.set(connection.id, { available: true, authenticated: true, busy: false });
       const started = await rpc.call('thread/start', {
         model, modelProvider: 'openai', cwd: this.workDir(connection.id), ephemeral: true, environments: [], approvalPolicy: 'never', sandbox: 'read-only',
-        baseInstructions, developerInstructions: 'Return only the requested JSON action. Never request approval or tools.',
+        baseInstructions,
         runtimeWorkspaceRoots: [], selectedCapabilityRoots: [], dynamicTools: [],
       });
       const threadId = String(started?.thread?.id ?? '');
@@ -313,9 +315,9 @@ export class CodexManager implements CodexManagerLike {
           this.checkedAt.set(connectionId, Date.now()); this.options.onLoginComplete?.(connectionId); return;
         }
       }
-      if (this.loginProcesses.get(connectionId) === login) this.statuses.set(connectionId, { available: true, authenticated: false, busy: false, message: 'Codex 인증 시간이 초과되었습니다.' });
-    } catch {
-      if (this.loginProcesses.get(connectionId) === login) this.statuses.set(connectionId, { available: true, authenticated: false, busy: false, message: 'Codex 인증 상태를 확인하지 못했습니다.' });
+      if (this.loginProcesses.get(connectionId) === login) { const message = 'Codex 인증 시간이 초과되었습니다.'; this.statuses.set(connectionId, { available: true, authenticated: false, busy: false, message }); this.options.onAuthError?.(connectionId, new Error(message)); }
+    } catch (error) {
+      if (this.loginProcesses.get(connectionId) === login) { const message = sanitizeError(error instanceof Error ? error.message : 'Codex 인증 상태를 확인하지 못했습니다.'); this.statuses.set(connectionId, { available: true, authenticated: false, busy: false, message }); this.options.onAuthError?.(connectionId, error); }
     } finally { login.rpc.close(); await login.rpc.waitForExit().catch(() => undefined); if (this.loginProcesses.get(connectionId) === login) this.loginProcesses.delete(connectionId); }
   }
   private checkVersion(command: Command): Promise<boolean> {

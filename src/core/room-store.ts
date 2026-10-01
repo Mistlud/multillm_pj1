@@ -1,11 +1,13 @@
-import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { createHash, randomUUID } from "node:crypto";
 import { assertTokenLimit, countTokens, type TokenCounter } from "./tokens.js";
 import type {
   AddConnectionInput, AddParticipantInput, AppendResInput, Connection, CoreLimits, Cursor, Cycle, CycleSnapshot,
   FinalAction, ModelInput, Participant, ParticipantDetail, ParticipantMemo, ParticipantRuntime, Post, PublicRes, Room, Thread,
-  RuntimeStatus, UpdateConnectionInput, UpdateParticipantInput, UsageRecord, UsageSummary,
+  RuntimeStatus, UpdateConnectionInput, UpdateParticipantInput, UsageRecord, UsageSummary, UsageDetails, UsageAggregate, CycleDetail, CycleEvent, ErrorRecord,
 } from "./types.js";
+import { sanitizeError } from "./redaction.js";
+import { CorePromptConflictError, DEFAULT_CORE_PROMPT, validateCorePrompt } from './prompt-template.js';
 
 export const DEFAULT_LIMITS: CoreLimits = {
   messageTokens: 200,
@@ -101,6 +103,25 @@ export class RoomStore {
     return row ? this.mapRoom(row) : null;
   }
 
+  getCorePrompt(roomId: string): string {
+    const row = this.db.prepare('SELECT core_prompt FROM room_settings WHERE room_id = ?').get(roomId) as SqlRow | undefined;
+    return row ? String(row.core_prompt) : DEFAULT_CORE_PROMPT;
+  }
+
+  /** Returns false for an unchanged template; running cycles retain their captured input. */
+  setCorePrompt(roomId: string, template: string, expectedTemplate: string): boolean {
+    validateCorePrompt(template);
+    return this.transaction(() => {
+      if (!this.getRoom(roomId)) throw new Error('room not found');
+      const current = this.getCorePrompt(roomId);
+      if (current !== expectedTemplate) throw new CorePromptConflictError('다른 화면에서 공통 프롬프트가 변경되었습니다. 저장된 내용을 다시 불러온 뒤 수정하세요.');
+      if (current === template) return false;
+      this.db.prepare('INSERT INTO room_settings (room_id, core_prompt) VALUES (?, ?) ON CONFLICT(room_id) DO UPDATE SET core_prompt = excluded.core_prompt').run(roomId, template);
+      this.db.prepare("UPDATE participant_runtime SET permanent_error = 0, last_error = NULL, blocked_thread_id = NULL, blocked_res = NULL, blocked_input_signature = NULL, status = CASE WHEN (SELECT enabled FROM participants p WHERE p.id = participant_runtime.participant_id) = 1 THEN 'idle' ELSE 'off' END WHERE active_cycle_id IS NULL AND participant_id IN (SELECT id FROM participants WHERE room_id = ? AND deleted_at IS NULL)").run(roomId);
+      return true;
+    });
+  }
+
   getCurrentThread(roomId: string): Thread | null {
     const row = this.db.prepare("SELECT t.* FROM rooms r JOIN threads t ON t.id = r.current_thread_id WHERE r.id = ?").get(roomId) as SqlRow | undefined;
     return row ? this.mapThread(row) : null;
@@ -113,6 +134,44 @@ export class RoomStore {
 
   listThreads(roomId: string): Thread[] {
     return (this.db.prepare("SELECT * FROM threads WHERE room_id = ? ORDER BY number DESC").all(roomId) as SqlRow[]).map((row) => this.mapThread(row));
+  }
+
+  /** Builds exactly the app-level input used by a cycle, without reserving a cycle or changing cursors. */
+  previewParticipant(participantId: string): { participant: ParticipantDetail; connection: Connection | null; input: ModelInput } | null {
+    const detail = this.getParticipant(participantId); if (!detail) return null;
+    const thread = this.getCurrentThread(detail.roomId); if (!thread) return null;
+    return { participant: detail, connection: detail.connectionId ? this.getConnection(detail.connectionId) : null, input: this.buildModelInput(detail, thread) };
+  }
+
+  forceRollover(roomId: string): Thread {
+    return this.transaction(() => {
+      const thread = this.getCurrentThread(roomId); if (!thread || thread.status !== 'open') throw new Error('room has no open thread');
+      const now = this.now(), id = randomUUID(); this.db.prepare("UPDATE threads SET status = 'closed', closed_at = ? WHERE id = ?").run(now, thread.id);
+      this.db.prepare("INSERT INTO threads (id, room_id, number, status, res_count, created_at) VALUES (?, ?, ?, 'open', 0, ?)").run(id, roomId, thread.number + 1, now);
+      this.db.prepare("UPDATE rooms SET current_thread_id = ? WHERE id = ?").run(id, roomId); return this.getCurrentThread(roomId)!;
+    });
+  }
+
+  deleteThreads(roomId: string, threadNumbers: number[]): number {
+    if (!threadNumbers.length) return 0;
+    return this.transaction(() => { const marks = threadNumbers.filter((value) => Number.isSafeInteger(value) && value > 0); if (!marks.length) return 0; const placeholders = marks.map(() => '?').join(','); const result = this.db.prepare(`UPDATE threads SET deleted_at = ? WHERE room_id = ? AND status = 'closed' AND number IN (${placeholders}) AND deleted_at IS NULL`).run(this.now(), roomId, ...marks); return Number(result.changes); });
+  }
+  deletePost(roomId: string, postId: number): boolean { return this.transaction(() => Number(this.db.prepare("UPDATE posts SET deleted_at = ? WHERE room_id = ? AND id = ? AND deleted_at IS NULL").run(this.now(), roomId, postId).changes) > 0); }
+
+  hardReset(roomId: string): Thread {
+    return this.transaction(() => {
+      if (!this.getRoom(roomId)) throw new Error('room not found'); const now = this.now(), id = randomUUID();
+      // Trigger changes are transactional: failures restore the original protections too.
+      this.db.exec('DROP TRIGGER res_is_immutable_delete; DROP TRIGGER post_is_immutable_delete;');
+      this.db.prepare("DELETE FROM res_search WHERE res_id IN (SELECT r.id FROM res r JOIN threads t ON t.id = r.thread_id WHERE t.room_id = ?)").run(roomId);
+      if (this.hasFts5) this.db.prepare("DELETE FROM res_fts WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM usage WHERE cycle_id IN (SELECT id FROM cycles WHERE room_id = ?)").run(roomId); this.db.prepare("DELETE FROM cycle_events WHERE cycle_id IN (SELECT id FROM cycles WHERE room_id = ?)").run(roomId); this.db.prepare("DELETE FROM cycles WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM res WHERE thread_id IN (SELECT id FROM threads WHERE room_id = ?)").run(roomId); this.db.prepare("DELETE FROM posts WHERE room_id = ?").run(roomId); this.db.prepare("DELETE FROM threads WHERE room_id = ?").run(roomId);
+      this.db.exec("CREATE TRIGGER res_is_immutable_delete BEFORE DELETE ON res BEGIN SELECT RAISE(ABORT, 'res is immutable'); END; CREATE TRIGGER post_is_immutable_delete BEFORE DELETE ON posts BEGIN SELECT RAISE(ABORT, 'post is immutable'); END;");
+      this.db.prepare("INSERT INTO threads (id, room_id, number, status, res_count, created_at) VALUES (?, ?, 1, 'open', 0, ?)").run(id, roomId, now); this.db.prepare("UPDATE rooms SET current_thread_id = ? WHERE id = ?").run(id, roomId);
+      this.db.prepare("UPDATE participants SET private_memo = '', updated_at = ? WHERE room_id = ?").run(now, roomId); this.db.prepare("UPDATE participant_runtime SET observed_thread_id = NULL, observed_res = NULL, last_posted_thread_id = NULL, last_posted_res = NULL, active_cycle_id = NULL, next_poll_at = NULL, last_error = NULL, blocked_thread_id = NULL, blocked_res = NULL, blocked_input_signature = NULL, permanent_error = 0, status = CASE WHEN (SELECT enabled FROM participants p WHERE p.id = participant_runtime.participant_id) = 1 THEN 'idle' ELSE 'off' END WHERE participant_id IN (SELECT id FROM participants WHERE room_id = ?)").run(roomId);
+      return this.getCurrentThread(roomId)!;
+    });
   }
 
   listThreadRes(threadId: string): PublicRes[] {
@@ -136,7 +195,7 @@ export class RoomStore {
       const finalMessage = `${input.message}\n>>P${postId}`;
       this.assertMessage(finalMessage);
       const res = this.appendResInTransaction({ roomId: input.roomId, author, body: finalMessage, generatedFrom: input.generatedFrom ?? null }, postId, now);
-      return { post: { id: postId, roomId: input.roomId, author, title: input.title, body: input.body, createdAt: now }, res };
+      return { post: { id: postId, roomId: input.roomId, author, title: input.title, body: input.body, createdAt: now, deletedAt: null }, res };
     });
   }
 
@@ -161,14 +220,15 @@ export class RoomStore {
   searchArchive(roomId: string, query: string, limit = 20): PublicRes[] {
     if (!query.trim()) return [];
     if (this.hasFts5) try {
-      return (this.db.prepare(`${this.resSelect} JOIN res_fts f ON f.res_id = r.id WHERE f.body MATCH ? AND t.room_id = ? AND t.status = 'closed' ORDER BY rank LIMIT ?`).all(query, roomId, limit) as SqlRow[]).map((row) => this.mapRes(row));
+      return (this.db.prepare(`${this.resSelect} JOIN res_fts f ON f.res_id = r.id WHERE f.body MATCH ? AND t.room_id = ? AND t.status = 'closed' AND t.deleted_at IS NULL ORDER BY rank LIMIT ?`).all(query, roomId, limit) as SqlRow[]).map((row) => this.mapRes(row));
     } catch (error) {
       throw new Error(`archive query is invalid: ${error instanceof Error ? error.message : String(error)}`);
     }
     const terms = searchTerms(query); if (!terms.length) return [];
     const placeholders = terms.map(() => "?").join(",");
-    const sql = `${this.resSelect} JOIN res_search s ON s.res_id = r.id WHERE t.room_id = ? AND t.status = 'closed' AND s.term IN (${placeholders}) GROUP BY r.id HAVING COUNT(DISTINCT s.term) = ? ORDER BY r.created_at DESC LIMIT ?`;
-    return (this.db.prepare(sql).all(roomId, ...terms, terms.length, limit) as SqlRow[]).map((row) => this.mapRes(row));
+    const bodyTerms = terms.map(() => 'instr(lower(r.body), lower(?)) > 0').join(' AND ');
+    const sql = `${this.resSelect} JOIN res_search s ON s.res_id = r.id WHERE t.room_id = ? AND t.status = 'closed' AND t.deleted_at IS NULL AND s.term IN (${placeholders}) AND ${bodyTerms} GROUP BY r.id HAVING COUNT(DISTINCT s.term) = ? ORDER BY r.created_at DESC LIMIT ?`;
+    return (this.db.prepare(sql).all(roomId, ...terms, ...terms, terms.length, limit) as SqlRow[]).map((row) => this.mapRes(row));
   }
 
   addConnection(input: AddConnectionInput): Connection {
@@ -313,13 +373,7 @@ export class RoomStore {
       this.db.prepare("INSERT INTO cycles (id, participant_id, room_id, server_run_id, snapshot_thread_id, snapshot_thread_number, snapshot_res, snapshot_post_id, input_signature, observed_thread_id, observed_res, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'calling', ?)")
         .run(cycleId, detail.id, detail.roomId, input.serverRunId, snapshot.threadId, snapshot.threadNumber, snapshot.latestResNumber, snapshot.maxPostId, inputSignature, observed?.threadId ?? null, observed?.resNumber ?? null, startedAt);
       this.db.prepare("UPDATE participant_runtime SET active_cycle_id = ?, status = 'calling', last_error = NULL, next_poll_at = NULL WHERE participant_id = ?").run(cycleId, detail.id);
-      const references = new Map<number, { id: number; title: string; author: string }>();
-      for (const message of messages) if (message.postId !== null) { const post = this.readPost(detail.roomId, message.postId); if (post) references.set(post.id, { id: post.id, title: post.title, author: post.author.displayName }); }
-      const inputDto: ModelInput = {
-        participantName: detail.displayName, systemPrompt: detail.systemPrompt, privateMemo: detail.privateMemo,
-        currentThread: { id: thread.id, number: thread.number, latestResNumber: thread.resCount, isRolloverSinceObserved: observed?.threadId !== thread.id, newlyObservedAfter: after,
-          messages: messages.map((message) => ({ thread: message.threadNumber, res: message.number, author: message.author.displayName, content: message.body })), postReferences: [...references.values()] },
-      };
+      const inputDto = this.buildModelInput(detail, thread);
       const cycle: Cycle = { id: cycleId, participantId: detail.id, roomId: detail.roomId, serverRunId: input.serverRunId, snapshot, inputSignature, status: "calling", startedAt, completedAt: null, error: null };
       return { cycle, participant: this.participantOnly(detail), connection: detail.connectionId ? this.getConnection(detail.connectionId) : null, input: inputDto };
     });
@@ -341,7 +395,7 @@ export class RoomStore {
         const inserted = this.db.prepare("INSERT INTO posts (room_id, author_type, author_id, author_display_name, title, body, created_at) VALUES (?, 'participant', ?, ?, ?, ?, ?)")
           .run(cycle.roomId, participant.id, participant.displayName, input.action.title, input.action.body, now);
         const postId = Number(inserted.lastInsertRowid); const body = `${input.action.message}\n>>P${postId}`; this.assertMessage(body);
-        post = { id: postId, roomId: cycle.roomId, author: { type: "participant", id: participant.id, displayName: participant.displayName }, title: input.action.title, body: input.action.body, createdAt: now };
+        post = { id: postId, roomId: cycle.roomId, author: { type: "participant", id: participant.id, displayName: participant.displayName }, title: input.action.title, body: input.action.body, createdAt: now, deletedAt: null };
         res = this.appendResInTransaction({ roomId: cycle.roomId, author: post.author, body, generatedFrom }, postId, now);
       }
       const memo = input.action.memo === undefined || input.action.memo === null ? participant.privateMemo : input.action.memo;
@@ -350,6 +404,7 @@ export class RoomStore {
       this.db.prepare("UPDATE participant_runtime SET observed_thread_id = ?, observed_res = ?, last_posted_thread_id = ?, last_posted_res = ?, active_cycle_id = NULL, status = ?, last_error = NULL, blocked_thread_id = NULL, blocked_res = NULL, blocked_input_signature = NULL, permanent_error = 0 WHERE participant_id = ?")
         .run(cycle.snapshot.threadId, cycle.snapshot.latestResNumber, res?.threadId ?? participant.runtime.lastPosted?.threadId ?? null, res?.number ?? participant.runtime.lastPosted?.resNumber ?? null, nextStatus, participant.id);
       this.db.prepare("UPDATE cycles SET status = 'completed', completed_at = ? WHERE id = ?").run(this.now(), cycle.id);
+      this.recordCycleEvent(cycle.id, 'final', { action: input.action.action, resId: res?.id ?? null, postId: post?.id ?? null, thread: res?.threadNumber ?? null, res: res?.number ?? null });
       return { res, post };
     });
   }
@@ -367,16 +422,18 @@ export class RoomStore {
     });
   }
 
-  recordUsage(input: { participantId: string; connectionId: string | null; cycleId: string; requestId?: string; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; providerUsage?: Record<string, unknown> }): UsageRecord {
+  recordUsage(input: { participantId: string; connectionId: string | null; cycleId: string; participantName?: string; connectionName?: string; connectionType?: string; requestId?: string; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; reasoningTokens?: number | null; providerUsage?: Record<string, unknown> }): UsageRecord {
     const createdAt = this.now();
-    const result = this.db.prepare("INSERT INTO usage (participant_id, connection_id, cycle_id, request_id, input_tokens, output_tokens, cached_input_tokens, provider_usage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(input.participantId, input.connectionId, input.cycleId, input.requestId ?? null, input.inputTokens ?? null, input.outputTokens ?? null, input.cachedInputTokens ?? null, input.providerUsage ? json(input.providerUsage) : null, createdAt);
-    return { id: Number(result.lastInsertRowid), participantId: input.participantId, connectionId: input.connectionId, cycleId: input.cycleId, requestId: input.requestId ?? null, inputTokens: input.inputTokens ?? null, outputTokens: input.outputTokens ?? null, cachedInputTokens: input.cachedInputTokens ?? null, providerUsage: input.providerUsage ?? null, createdAt };
+    const participant = this.requireParticipantDetail(input.participantId); const currentConnection = input.connectionId ? this.getConnection(input.connectionId) : null; const connection = currentConnection ? { ...currentConnection, name: input.connectionName ?? currentConnection.name, type: input.connectionType ?? currentConnection.type } : null; participant.displayName = input.participantName ?? participant.displayName; const simulated = input.providerUsage?.simulated === true || connection?.type === 'mock';
+    const result = this.db.prepare("INSERT INTO usage (participant_id, participant_name, connection_id, connection_name, connection_type, simulated, cycle_id, request_id, input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, provider_usage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(input.participantId, participant.displayName, input.connectionId, connection?.name ?? null, connection?.type ?? null, Number(simulated), input.cycleId, input.requestId ?? null, input.inputTokens ?? null, input.outputTokens ?? null, input.cachedInputTokens ?? null, input.reasoningTokens ?? null, input.providerUsage ? json(sanitizeError(input.providerUsage)) : null, createdAt);
+    return { id: Number(result.lastInsertRowid), participantId: input.participantId, participantName: participant.displayName, connectionId: input.connectionId, connectionName: connection?.name ?? null, connectionType: connection?.type ?? null, simulated, cycleId: input.cycleId, requestId: input.requestId ?? null, inputTokens: input.inputTokens ?? null, outputTokens: input.outputTokens ?? null, cachedInputTokens: input.cachedInputTokens ?? null, reasoningTokens: input.reasoningTokens ?? null, providerUsage: input.providerUsage ?? null, createdAt };
   }
 
-  updateUsage(usageId: number, usage: { requestId?: string; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; providerUsage?: Record<string, unknown> }): void {
-    this.db.prepare("UPDATE usage SET request_id = ?, input_tokens = ?, output_tokens = ?, cached_input_tokens = ?, provider_usage_json = ? WHERE id = ?")
-      .run(usage.requestId ?? null, usage.inputTokens ?? null, usage.outputTokens ?? null, usage.cachedInputTokens ?? null, usage.providerUsage ? json(usage.providerUsage) : null, usageId);
+  updateUsage(usageId: number, usage: { requestId?: string; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; reasoningTokens?: number | null; providerUsage?: Record<string, unknown> }, cycleId?: string): void {
+    const suffix = cycleId ? ' AND cycle_id = ?' : '';
+    this.db.prepare(`UPDATE usage SET request_id = ?, input_tokens = ?, output_tokens = ?, cached_input_tokens = ?, reasoning_tokens = ?, provider_usage_json = ? WHERE id = ?${suffix}`)
+      .run(usage.requestId ?? null, usage.inputTokens ?? null, usage.outputTokens ?? null, usage.cachedInputTokens ?? null, usage.reasoningTokens ?? null, usage.providerUsage ? json(sanitizeError(usage.providerUsage)) : null, usageId, ...(cycleId ? [cycleId] : []));
   }
 
   getUsageSummary(input: { roomId?: string; participantId?: string } = {}): UsageSummary {
@@ -387,6 +444,49 @@ export class RoomStore {
     const row = this.db.prepare(`SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens FROM usage u${join}${where}`).get(...values) as SqlRow;
     return { calls: number(row.calls), inputTokens: number(row.input_tokens), outputTokens: number(row.output_tokens), cachedInputTokens: number(row.cached_input_tokens) };
   }
+
+  listUsage(roomId: string, filters: { participantId?: string; connectionId?: string; cycleId?: string; limit?: number; beforeId?: number } = {}): UsageRecord[] {
+    const clauses = ['c.room_id = ?']; const values: SQLInputValue[] = [roomId];
+    for (const [column, value] of [['u.participant_id', filters.participantId], ['u.connection_id', filters.connectionId], ['u.cycle_id', filters.cycleId]] as const) if (value) { clauses.push(`${column} = ?`); values.push(value); }
+    if (filters.beforeId) { clauses.push('u.id < ?'); values.push(filters.beforeId); }
+    values.push(Math.min(Math.max(filters.limit ?? 100, 1), 500));
+    return (this.db.prepare(`SELECT u.* FROM usage u JOIN cycles c ON c.id = u.cycle_id WHERE ${clauses.join(' AND ')} ORDER BY u.id DESC LIMIT ?`).all(...values) as SqlRow[]).map((row) => this.mapUsage(row));
+  }
+  getUsageDetails(roomId: string): UsageDetails {
+    const aggregate = (kind: 'participant' | 'connection'): UsageAggregate[] => {
+      const id = kind === 'participant' ? 'u.participant_id' : 'u.connection_id'; const name = kind === 'participant' ? 'u.participant_name' : 'u.connection_name'; const type = kind === 'connection' ? 'u.connection_type' : 'NULL';
+      return (this.db.prepare(`SELECT ${id} AS id, MAX(${name}) AS display_name, MAX(${type}) AS type, COUNT(*) AS calls, SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, SUM(u.cached_input_tokens) AS cached_input_tokens, SUM(u.reasoning_tokens) AS reasoning_tokens, MAX(u.simulated) AS simulated FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE cy.room_id = ? GROUP BY ${id}`).all(roomId) as SqlRow[]).map((row) => ({ id: String(row.id), displayName: nullableString(row.display_name), type: nullableString(row.type), calls: number(row.calls), inputTokens: row.input_tokens === null ? null : number(row.input_tokens), outputTokens: row.output_tokens === null ? null : number(row.output_tokens), cachedInputTokens: row.cached_input_tokens === null ? null : number(row.cached_input_tokens), reasoningTokens: row.reasoning_tokens === null ? null : number(row.reasoning_tokens), simulated: Boolean(row.simulated) }));
+    };
+    return { participants: aggregate('participant'), connections: aggregate('connection') };
+  }
+  listCycles(roomId: string, filters: { participantId?: string; limit?: number; beforeStartedAt?: number } = {}): Cycle[] {
+    const clauses = ['room_id = ?']; const values: SQLInputValue[] = [roomId]; if (filters.participantId) { clauses.push('participant_id = ?'); values.push(filters.participantId); } if (filters.beforeStartedAt) { clauses.push('started_at < ?'); values.push(filters.beforeStartedAt); } values.push(Math.min(Math.max(filters.limit ?? 100, 1), 500));
+    return (this.db.prepare(`SELECT * FROM cycles WHERE ${clauses.join(' AND ')} ORDER BY started_at DESC LIMIT ?`).all(...values) as SqlRow[]).map((row) => this.mapCycle(row));
+  }
+  getCycleOverview(cycleId: string): { finalAction: string | null; result: Record<string, unknown> | null; errorId: number | null } {
+    const row = this.db.prepare("SELECT payload_json FROM cycle_events WHERE cycle_id = ? AND kind = 'final' ORDER BY id DESC LIMIT 1").get(cycleId) as SqlRow | undefined;
+    const final = row ? parseObject(row.payload_json) : null;
+    const error = this.db.prepare('SELECT id FROM errors WHERE cycle_id = ? ORDER BY id DESC LIMIT 1').get(cycleId) as SqlRow | undefined;
+    return { finalAction: typeof final?.action === 'string' ? final.action : null, result: final ? { resId: final.resId ?? null, postId: final.postId ?? null, thread: final.thread ?? null, res: final.res ?? null } : null, errorId: error ? number(error.id) : null };
+  }
+  getParticipantCycleState(participant: ParticipantDetail) {
+    const active = participant.runtime.activeCycleId ? this.db.prepare('SELECT started_at FROM cycles WHERE id = ?').get(participant.runtime.activeCycleId) as SqlRow | undefined : undefined;
+    const last = this.db.prepare("SELECT id, completed_at FROM cycles WHERE participant_id = ? AND completed_at IS NOT NULL ORDER BY completed_at DESC, rowid DESC LIMIT 1").get(participant.id) as SqlRow | undefined;
+    const action = this.db.prepare("SELECT e.payload_json FROM cycle_events e JOIN cycles c ON c.id = e.cycle_id WHERE c.participant_id = ? AND e.kind = 'final' ORDER BY e.id DESC LIMIT 1").get(participant.id) as SqlRow | undefined;
+    const observed = participant.runtime.observed ? this.db.prepare('SELECT number FROM threads WHERE id = ?').get(participant.runtime.observed.threadId) as SqlRow | undefined : undefined;
+    return { activeStartedAt: active ? number(active.started_at) : null, lastCompletedAt: last ? number(last.completed_at) : null, lastAction: action ? parseObject(action.payload_json).action : null, observedThreadNumber: observed ? number(observed.number) : null };
+  }
+  getCycleDetail(roomId: string, cycleId: string): CycleDetail | null {
+    const row = this.db.prepare('SELECT * FROM cycles WHERE id = ? AND room_id = ?').get(cycleId, roomId) as SqlRow | undefined; if (!row) return null; const cycle = this.mapCycle(row);
+    const events = (this.db.prepare('SELECT * FROM cycle_events WHERE cycle_id = ? ORDER BY id').all(cycleId) as SqlRow[]).map((event) => this.mapCycleEvent(event)); const usage = this.listUsage(roomId, { cycleId, limit: 500 });
+    const final = events.find((event) => event.kind === 'final')?.payload;
+    return { cycle, events, usage, result: final ? { resId: typeof final.resId === 'number' ? final.resId : null, postId: typeof final.postId === 'number' ? final.postId : null } : null };
+  }
+  recordCycleEvent(cycleId: string, kind: CycleEvent['kind'], payload?: Record<string, unknown>): CycleEvent { const result = this.db.prepare('INSERT INTO cycle_events (cycle_id, kind, payload_json, created_at) VALUES (?, ?, ?, ?)').run(cycleId, kind, payload ? json(sanitizeError(payload)) : null, this.now()); return { id: Number(result.lastInsertRowid), cycleId, kind, payload: sanitizeError(payload) ?? null, createdAt: this.now() }; }
+  recordError(input: Omit<ErrorRecord, 'id' | 'createdAt'>): ErrorRecord { const safe = sanitizeError(input); const result = this.db.prepare('INSERT INTO errors (room_id, source, participant_id, connection_id, cycle_id, http_status, provider_code, message, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(input.roomId, safe.source, input.participantId, input.connectionId, input.cycleId, input.httpStatus, safe.providerCode, String(safe.message ?? '오류'), safe.details === undefined ? null : json(safe.details), this.now()); return { ...input, id: Number(result.lastInsertRowid), message: String(safe.message ?? '오류'), details: safe.details, createdAt: this.now() }; }
+  listErrors(roomId: string, filters: { participantId?: string; connectionId?: string; cycleId?: string; limit?: number; beforeId?: number } = {}): ErrorRecord[] { const clauses = ['room_id = ?']; const values: SQLInputValue[] = [roomId]; for (const [column, value] of [['participant_id', filters.participantId], ['connection_id', filters.connectionId], ['cycle_id', filters.cycleId]] as const) if (value) { clauses.push(`${column} = ?`); values.push(value); } if (filters.beforeId) { clauses.push('id < ?'); values.push(filters.beforeId); } values.push(Math.min(Math.max(filters.limit ?? 100, 1), 500)); return (this.db.prepare(`SELECT * FROM errors WHERE ${clauses.join(' AND ')} ORDER BY id DESC LIMIT ?`).all(...values) as SqlRow[]).map((row) => this.mapError(row)); }
+  clearErrors(roomId: string): number { return Number(this.db.prepare('DELETE FROM errors WHERE room_id = ?').run(roomId).changes); }
+  getError(roomId: string, id: number): ErrorRecord | null { const row = this.db.prepare('SELECT * FROM errors WHERE room_id = ? AND id = ?').get(roomId, id) as SqlRow | undefined; return row ? this.mapError(row) : null; }
 
   setNextPoll(participantId: string, at: number | null): void {
     this.db.prepare("UPDATE participant_runtime SET next_poll_at = ? WHERE participant_id = ? AND active_cycle_id IS NULL").run(at, participantId);
@@ -409,7 +509,7 @@ export class RoomStore {
   }
 
   private get resSelect(): string {
-    return "SELECT r.*, t.number AS thread_number FROM res r JOIN threads t ON t.id = r.thread_id";
+    return "SELECT r.*, t.number AS thread_number, t.deleted_at AS thread_deleted_at FROM res r JOIN threads t ON t.id = r.thread_id";
   }
 
   private appendResInTransaction(input: AppendResInput, postId: number | null = null, createdAt = this.now()): PublicRes {
@@ -454,28 +554,33 @@ export class RoomStore {
   }
   private inputSignature(participant: Participant): string {
     const connection = participant.connectionId ? this.getConnection(participant.connectionId) : null;
-    return JSON.stringify({ displayName: participant.displayName, modelId: participant.modelId, modelOptions: participant.modelOptions, systemPrompt: participant.systemPrompt, privateMemo: participant.privateMemo, connection: connection ? { id: connection.id, type: connection.type, config: connection.config, credentialRef: connection.credentialRef } : null });
+    return JSON.stringify({ displayName: participant.displayName, modelId: participant.modelId, modelOptions: participant.modelOptions, systemPrompt: participant.systemPrompt, corePromptHash: createHash('sha256').update(this.getCorePrompt(participant.roomId), 'utf8').digest('hex'), privateMemo: participant.privateMemo, connection: connection ? { id: connection.id, type: connection.type, config: connection.config, credentialRef: connection.credentialRef } : null });
   }
   private transaction<T>(operation: () => T): T { this.db.exec("BEGIN IMMEDIATE"); try { const result = operation(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; } }
 
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, current_thread_id TEXT NOT NULL, created_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), number INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','closed')), res_count INTEGER NOT NULL CHECK(res_count BETWEEN 0 AND 1000), created_at INTEGER NOT NULL, closed_at INTEGER, UNIQUE(room_id, number));
+      CREATE TABLE IF NOT EXISTS room_settings (room_id TEXT PRIMARY KEY REFERENCES rooms(id), core_prompt TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), number INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','closed')), res_count INTEGER NOT NULL CHECK(res_count BETWEEN 0 AND 1000), created_at INTEGER NOT NULL, closed_at INTEGER, deleted_at INTEGER, UNIQUE(room_id, number));
       CREATE TABLE IF NOT EXISTS res (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 1000), author_type TEXT NOT NULL CHECK(author_type IN ('admin','participant')), author_id TEXT, author_display_name TEXT NOT NULL, body TEXT NOT NULL, post_id INTEGER, generated_from_thread_id TEXT, generated_from_res INTEGER, created_at INTEGER NOT NULL, UNIQUE(thread_id, number));
-      CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), author_type TEXT NOT NULL CHECK(author_type IN ('admin','participant')), author_id TEXT, author_display_name TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), author_type TEXT NOT NULL CHECK(author_type IN ('admin','participant')), author_id TEXT, author_display_name TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL, deleted_at INTEGER);
       CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, config_json TEXT NOT NULL, credential_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), display_name TEXT NOT NULL, avatar TEXT, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), connection_id TEXT REFERENCES connections(id), model_id TEXT NOT NULL, model_options_json TEXT NOT NULL, system_prompt TEXT NOT NULL, private_memo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER);
       CREATE TABLE IF NOT EXISTS participant_runtime (participant_id TEXT PRIMARY KEY REFERENCES participants(id), observed_thread_id TEXT, observed_res INTEGER, last_posted_thread_id TEXT, last_posted_res INTEGER, next_poll_at INTEGER, status TEXT NOT NULL, active_cycle_id TEXT, last_error TEXT, blocked_thread_id TEXT, blocked_res INTEGER, blocked_input_signature TEXT, permanent_error INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS cycles (id TEXT PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), room_id TEXT NOT NULL REFERENCES rooms(id), server_run_id TEXT NOT NULL, snapshot_thread_id TEXT NOT NULL, snapshot_thread_number INTEGER NOT NULL, snapshot_res INTEGER NOT NULL, snapshot_post_id INTEGER NOT NULL DEFAULT 0, input_signature TEXT NOT NULL DEFAULT '', observed_thread_id TEXT, observed_res INTEGER, status TEXT NOT NULL, started_at INTEGER NOT NULL, completed_at INTEGER, error TEXT);
-      CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), connection_id TEXT, cycle_id TEXT NOT NULL REFERENCES cycles(id), request_id TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_input_tokens INTEGER, provider_usage_json TEXT, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), participant_name TEXT, connection_id TEXT, connection_name TEXT, connection_type TEXT, simulated INTEGER NOT NULL DEFAULT 0, cycle_id TEXT NOT NULL REFERENCES cycles(id), request_id TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_input_tokens INTEGER, reasoning_tokens INTEGER, provider_usage_json TEXT, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS cycle_events (id INTEGER PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES cycles(id), kind TEXT NOT NULL, payload_json TEXT, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), source TEXT NOT NULL, participant_id TEXT, connection_id TEXT, cycle_id TEXT, http_status INTEGER, provider_code TEXT, message TEXT NOT NULL, details_json TEXT, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_res_thread_number ON res(thread_id, number); CREATE INDEX IF NOT EXISTS idx_threads_room_number ON threads(room_id, number); CREATE INDEX IF NOT EXISTS idx_cycles_participant_status ON cycles(participant_id, status); CREATE INDEX IF NOT EXISTS idx_usage_participant ON usage(participant_id);
       CREATE TABLE IF NOT EXISTS res_search (res_id INTEGER NOT NULL REFERENCES res(id), term TEXT NOT NULL, PRIMARY KEY (res_id, term)); CREATE INDEX IF NOT EXISTS idx_res_search_term ON res_search(term);
       CREATE TRIGGER IF NOT EXISTS res_is_immutable_update BEFORE UPDATE ON res BEGIN SELECT RAISE(ABORT, 'res is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS res_is_immutable_delete BEFORE DELETE ON res BEGIN SELECT RAISE(ABORT, 'res is immutable'); END;
-      CREATE TRIGGER IF NOT EXISTS post_is_immutable_update BEFORE UPDATE ON posts BEGIN SELECT RAISE(ABORT, 'post is immutable'); END;
+      DROP TRIGGER IF EXISTS post_is_immutable_update;
+      CREATE TRIGGER post_is_immutable_update BEFORE UPDATE ON posts WHEN OLD.id IS NOT NEW.id OR OLD.room_id IS NOT NEW.room_id OR OLD.author_type IS NOT NEW.author_type OR OLD.author_id IS NOT NEW.author_id OR OLD.author_display_name IS NOT NEW.author_display_name OR OLD.title IS NOT NEW.title OR OLD.body IS NOT NEW.body OR OLD.created_at IS NOT NEW.created_at BEGIN SELECT RAISE(ABORT, 'post is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS post_is_immutable_delete BEFORE DELETE ON posts BEGIN SELECT RAISE(ABORT, 'post is immutable'); END;
     `);
+    for (const migration of ["ALTER TABLE threads ADD COLUMN deleted_at INTEGER", "ALTER TABLE posts ADD COLUMN deleted_at INTEGER", "ALTER TABLE usage ADD COLUMN participant_name TEXT", "ALTER TABLE usage ADD COLUMN connection_name TEXT", "ALTER TABLE usage ADD COLUMN connection_type TEXT", "ALTER TABLE usage ADD COLUMN simulated INTEGER NOT NULL DEFAULT 0", "ALTER TABLE usage ADD COLUMN reasoning_tokens INTEGER"]) try { this.db.exec(migration); } catch { /* Existing or freshly-created column. */ }
     this.ensureColumn("participant_runtime", "blocked_input_signature", "blocked_input_signature TEXT");
     this.ensureColumn("participant_runtime", "permanent_error", "permanent_error INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("participants", "deleted_at", "deleted_at INTEGER");
@@ -487,7 +592,7 @@ export class RoomStore {
   private addSearchIndex(res: PublicRes, roomId: string): void {
     if (this.hasFts5) { this.db.prepare("INSERT INTO res_fts (body, author_display_name, res_id, room_id) VALUES (?, ?, ?, ?)").run(res.body, res.author.displayName, res.id, roomId); return; }
     const insert = this.db.prepare("INSERT OR IGNORE INTO res_search (res_id, term) VALUES (?, ?)");
-    for (const term of searchTerms(`${res.author.displayName} ${res.body}`)) insert.run(res.id, term);
+    for (const term of searchTerms(res.body)) insert.run(res.id, term);
   }
   private ensureColumn(table: "participants" | "participant_runtime" | "cycles", column: string, definition: string): void {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
@@ -495,9 +600,18 @@ export class RoomStore {
   }
 
   private mapRoom(row: SqlRow): Room { return { id: String(row.id), name: String(row.name), currentThreadId: String(row.current_thread_id), createdAt: number(row.created_at) }; }
-  private mapThread(row: SqlRow): Thread { return { id: String(row.id), roomId: String(row.room_id), number: number(row.number), status: String(row.status) as Thread["status"], resCount: number(row.res_count), createdAt: number(row.created_at), closedAt: row.closed_at === null ? null : number(row.closed_at) }; }
-  private mapRes(row: SqlRow): PublicRes { return { id: number(row.id), threadId: String(row.thread_id), threadNumber: number(row.thread_number), number: number(row.number), author: { type: String(row.author_type) as PublicRes["author"]["type"], id: nullableString(row.author_id), displayName: String(row.author_display_name) }, body: String(row.body), postId: row.post_id === null ? null : number(row.post_id), generatedFrom: row.generated_from_thread_id === null ? null : { threadId: String(row.generated_from_thread_id), resNumber: number(row.generated_from_res) }, createdAt: number(row.created_at) }; }
-  private mapPost(row: SqlRow): Post { return { id: number(row.id), roomId: String(row.room_id), author: { type: String(row.author_type) as Post["author"]["type"], id: nullableString(row.author_id), displayName: String(row.author_display_name) }, title: String(row.title), body: String(row.body), createdAt: number(row.created_at) }; }
+  private mapThread(row: SqlRow): Thread { return { id: String(row.id), roomId: String(row.room_id), number: number(row.number), status: String(row.status) as Thread["status"], resCount: number(row.res_count), createdAt: number(row.created_at), closedAt: row.closed_at === null ? null : number(row.closed_at), deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : number(row.deleted_at) }; }
+  private buildModelInput(detail: ParticipantDetail, thread: Thread): ModelInput {
+    const messages = this.listThreadRes(thread.id); const observed = detail.runtime.observed; const after = observed?.threadId === thread.id ? observed.resNumber : 0;
+    const references = new Map<number, { id: number; title: string; author: string }>();
+    for (const message of messages) if (message.postId !== null) { const post = this.readPost(detail.roomId, message.postId); if (post) references.set(post.id, { id: post.id, title: post.title, author: post.author.displayName }); }
+    return { participantName: detail.displayName, systemPrompt: detail.systemPrompt, corePrompt: this.getCorePrompt(detail.roomId), privateMemo: detail.privateMemo, currentThread: { id: thread.id, number: thread.number, latestResNumber: thread.resCount, isRolloverSinceObserved: observed?.threadId !== thread.id, newlyObservedAfter: after, messages: messages.map((message) => ({ thread: message.threadNumber, res: message.number, author: message.author.displayName, content: message.body, createdAt: message.createdAt })), postReferences: [...references.values()] } };
+  }
+  private mapRes(row: SqlRow): PublicRes { const deleted = row.thread_deleted_at !== null && row.thread_deleted_at !== undefined; return { id: number(row.id), threadId: String(row.thread_id), threadNumber: number(row.thread_number), number: number(row.number), author: { type: String(row.author_type) as PublicRes["author"]["type"], id: nullableString(row.author_id), displayName: String(row.author_display_name) }, body: deleted ? '관리자에 의해 삭제된 불판입니다.' : String(row.body), postId: row.post_id === null ? null : number(row.post_id), generatedFrom: row.generated_from_thread_id === null ? null : { threadId: String(row.generated_from_thread_id), resNumber: number(row.generated_from_res) }, createdAt: number(row.created_at) }; }
+  private mapPost(row: SqlRow): Post { const deletedAt = row.deleted_at === null || row.deleted_at === undefined ? null : number(row.deleted_at); return { id: number(row.id), roomId: String(row.room_id), author: { type: String(row.author_type) as Post["author"]["type"], id: nullableString(row.author_id), displayName: String(row.author_display_name) }, title: deletedAt !== null ? '관리자에 의해 삭제된 게시글입니다.' : String(row.title), body: deletedAt !== null ? '관리자에 의해 삭제된 게시글입니다.' : String(row.body), createdAt: number(row.created_at), deletedAt }; }
+  private mapUsage(row: SqlRow): UsageRecord { return { id: number(row.id), participantId: String(row.participant_id), participantName: nullableString(row.participant_name), connectionId: nullableString(row.connection_id), connectionName: nullableString(row.connection_name), connectionType: nullableString(row.connection_type), simulated: Boolean(row.simulated), cycleId: String(row.cycle_id), requestId: nullableString(row.request_id), inputTokens: row.input_tokens === null ? null : number(row.input_tokens), outputTokens: row.output_tokens === null ? null : number(row.output_tokens), cachedInputTokens: row.cached_input_tokens === null ? null : number(row.cached_input_tokens), reasoningTokens: row.reasoning_tokens === null ? null : number(row.reasoning_tokens), providerUsage: row.provider_usage_json ? parseObject(row.provider_usage_json) : null, createdAt: number(row.created_at) }; }
+  private mapCycleEvent(row: SqlRow): CycleEvent { return { id: number(row.id), cycleId: String(row.cycle_id), kind: String(row.kind) as CycleEvent['kind'], payload: row.payload_json ? parseObject(row.payload_json) : null, createdAt: number(row.created_at) }; }
+  private mapError(row: SqlRow): ErrorRecord { const details = row.details_json ? sanitizeError(parseObject(row.details_json)) : null; return { id: number(row.id), roomId: String(row.room_id), source: String(row.source), participantId: nullableString(row.participant_id), connectionId: nullableString(row.connection_id), cycleId: nullableString(row.cycle_id), httpStatus: row.http_status === null ? null : number(row.http_status), providerCode: nullableString(row.provider_code), message: String(row.message), details, createdAt: number(row.created_at) }; }
   private mapConnection(row: SqlRow): Connection { return { id: String(row.id), name: String(row.name), type: String(row.type), config: parseObject(row.config_json), credentialRef: nullableString(row.credential_ref), createdAt: number(row.created_at), updatedAt: number(row.updated_at) }; }
   private mapParticipantDetail(row: SqlRow): ParticipantDetail { const participant: Participant = { id: String(row.id), roomId: String(row.room_id), displayName: String(row.display_name), avatar: nullableString(row.avatar), enabled: Boolean(row.enabled), connectionId: nullableString(row.connection_id), modelId: String(row.model_id), modelOptions: parseObject(row.model_options_json), systemPrompt: String(row.system_prompt), privateMemo: String(row.private_memo), createdAt: number(row.created_at), updatedAt: number(row.updated_at) }; const runtime: ParticipantRuntime = { participantId: participant.id, observed: row.observed_thread_id === null ? null : { threadId: String(row.observed_thread_id), resNumber: number(row.observed_res) }, lastPosted: row.last_posted_thread_id === null ? null : { threadId: String(row.last_posted_thread_id), resNumber: number(row.last_posted_res) }, nextPollAt: row.next_poll_at === null ? null : number(row.next_poll_at), status: String(row.status) as RuntimeStatus, activeCycleId: nullableString(row.active_cycle_id), lastError: nullableString(row.last_error), blockedAt: row.blocked_thread_id === null ? null : { threadId: String(row.blocked_thread_id), resNumber: number(row.blocked_res) }, blockedInputSignature: nullableString(row.blocked_input_signature), permanentError: Boolean(row.permanent_error) }; return { ...participant, runtime }; }
   private mapCycle(row: SqlRow): Cycle { return { id: String(row.id), participantId: String(row.participant_id), roomId: String(row.room_id), serverRunId: String(row.server_run_id), snapshot: { threadId: String(row.snapshot_thread_id), threadNumber: number(row.snapshot_thread_number), latestResNumber: number(row.snapshot_res), maxPostId: number(row.snapshot_post_id), observedBefore: row.observed_thread_id === null ? null : { threadId: String(row.observed_thread_id), resNumber: number(row.observed_res) } }, inputSignature: String(row.input_signature), status: String(row.status) as Cycle["status"], startedAt: number(row.started_at), completedAt: row.completed_at === null ? null : number(row.completed_at), error: nullableString(row.error) }; }

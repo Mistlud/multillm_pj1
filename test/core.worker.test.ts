@@ -10,6 +10,39 @@ async function setup() {
   return { db, room, participant };
 }
 
+for (const sample of [
+  { action: "reply", thread: 1, expectedThread: { value: 1, type: "number" }, allowedFields: ["action", "message", "memo"] },
+  { action: "read_post", thread: "2", expectedThread: { value: "2", type: "string" }, allowedFields: ["action", "postId"] },
+  { action: "wait", thread: { memo: "nested-private-sentinel" }, expectedThread: { value: "[non-scalar value omitted]", type: "object" }, allowedFields: ["action", "memo"] },
+]) {
+  test(`rejected action field diagnostics: ${sample.action}`, async () => {
+    const { db, room, participant } = await setup();
+    db.updateParticipant(participant.id, { privateMemo: "existing memo" });
+    db.appendRes({ roomId: room.id, author: { type: "admin", id: null, displayName: "admin" }, body: "hello" });
+    const response = { action: sample.action, thread: sample.thread, message: "body-private-sentinel", memo: "memo-private-sentinel" };
+    const manager = new WorkerManager(db, { adapters: () => ({ run: async () => ({ action: response, usage: { inputTokens: 12, outputTokens: 3 } }) }) });
+    try {
+      await manager.pollNow(participant.id);
+      const error = db.listErrors(room.id)[0]!;
+      const details = error.details as Record<string, unknown>;
+      assert.equal(error.message, "unknown action field: thread");
+      assert.equal(details.action, sample.action);
+      assert.deepEqual(details.thread, sample.expectedThread);
+      assert.deepEqual(details.receivedFields, Object.keys(response));
+      assert.deepEqual(details.allowedFields, sample.allowedFields);
+      assert.deepEqual(details.rejectedFields, Object.keys(response).filter((field) => !sample.allowedFields.includes(field)));
+      const cycle = db.getCycleDetail(room.id, error.cycleId!)!;
+      assert.equal(cycle.cycle.status, "failed");
+      assert.equal(db.getCurrentThread(room.id)!.resCount, 1);
+      assert.equal(db.getParticipant(participant.id)!.privateMemo, "existing memo");
+      assert.equal(db.getParticipant(participant.id)!.runtime.observed, null);
+      assert.equal(db.listUsage(room.id)[0]!.inputTokens, 12);
+      const stored = JSON.stringify({ error, events: cycle.events });
+      for (const sentinel of ["body-private-sentinel", "memo-private-sentinel", "nested-private-sentinel"]) assert.equal(stored.includes(sentinel), false);
+    } finally { manager.stop(); db.close(); }
+  });
+}
+
 test("input block rechecks locally after an actual model-input setting changes", async () => {
   const db = makeStore({ outputReserveTokens: 0 }); const room = db.createRoom({ name: "room" });
   const participant = db.addParticipant({ roomId: room.id, displayName: "A", modelId: "fake" });

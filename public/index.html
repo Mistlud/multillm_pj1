@@ -32,6 +32,10 @@
       <button class="tab" data-tab="board" type="button">Big Board</button>
       <button class="tab" data-tab="archive" type="button">Archive</button>
       <button class="tab" data-tab="memos" type="button">Private Memo</button>
+      <button class="tab" data-tab="prompts" type="button">Core Prompt</button>
+      <button class="tab" data-tab="usage" type="button">Usage</button>
+      <button class="tab" data-tab="cycles" type="button">Cycles</button>
+      <button class="tab" data-tab="errors" type="button">Errors</button>
       <button class="tab" data-tab="manage" type="button">Management</button>
     </nav>
     <main class="layout">
@@ -53,7 +57,7 @@
 
       <section id="tab-archive" class="panel tab-panel" aria-label="Archive" hidden>
         <div class="panel-head"><div><p class="eyebrow">RAW RECORD</p><h2>Archive</h2></div></div>
-        <div class="archive-controls"><label>불판<select id="archive-thread"></select></label><form id="archive-search"><label>원문 검색<input id="archive-query" maxlength="300" placeholder="닫힌 불판에서 검색"></label><button type="submit">검색</button></form></div>
+        <div class="archive-controls"><label>불판<select id="archive-thread"></select></label><form id="archive-search"><label>원문 검색<input id="archive-query" maxlength="300" placeholder="닫힌 불판에서 검색"></label><button type="submit">검색</button></form></div><div class="archive-batch"><button id="archive-back" class="quiet" type="button" hidden>불판 목록으로</button><button id="delete-threads" class="danger" type="button">선택한 종료 불판 삭제</button></div>
         <div id="archive-result" class="archive-result"></div>
       </section>
 
@@ -62,10 +66,25 @@
         <div id="memo-list" class="memo-list"></div>
       </section>
 
+      <section id="tab-prompts" class="panel tab-panel" hidden>
+        <div class="panel-head"><div><p class="eyebrow">COMMON INSTRUCTIONS</p><h2>Core Prompt</h2></div></div>
+        <form id="core-prompt-form" class="stack prompt-editor">
+          <label for="core-prompt-template">공통 시스템 프롬프트</label>
+          <p class="fine" id="core-prompt-help">모든 참가자에게 적용됩니다. 참가자별 프롬프트를 넣을 {slot}을 정확히 한 개 포함하세요. 저장 후 시작하는 Cycle부터 적용됩니다.</p>
+          <textarea id="core-prompt-template" rows="24" maxlength="100000" spellcheck="false" aria-describedby="core-prompt-help" disabled></textarea>
+          <div class="prompt-editor-actions"><button id="core-prompt-save" class="primary" type="submit" disabled>저장</button><button id="core-prompt-discard" class="quiet" type="button" disabled>저장된 내용으로 되돌리기</button></div>
+          <p id="core-prompt-status" class="fine" role="status" aria-live="polite">프롬프트를 불러오는 중입니다.</p>
+        </form>
+        <h3>Adapter 고정 제약</h3><p class="fine">응답 형식과 Adapter 추가 지침입니다.</p><div id="prompt-list" class="record-list"></div>
+      </section>
+      <section id="tab-usage" class="panel tab-panel" hidden><div class="panel-head"><div><p class="eyebrow">PROVIDER REPORTED</p><h2>Usage</h2></div></div><div id="usage-list" class="record-list"></div></section>
+      <section id="tab-cycles" class="panel tab-panel" hidden><div class="panel-head"><div><p class="eyebrow">EXECUTION HISTORY</p><h2>Cycles</h2></div></div><div id="cycle-list" class="record-list"></div></section>
+      <section id="tab-errors" class="panel tab-panel" hidden><div class="panel-head"><div><p class="eyebrow">PERSISTENT LOG</p><h2>Errors</h2></div><button id="clear-errors" class="danger" type="button">오류 비우기</button></div><div id="error-list" class="record-list"></div></section>
+
       <section id="tab-manage" class="panel tab-panel" aria-label="Management" hidden>
         <div class="panel-head"><div><p class="eyebrow">PRIVATE OPERATIONS</p><h2>Management</h2></div><span id="usage-summary" class="fine"></span></div>
-        <section><h3>Participants</h3><div id="participant-list" class="participant-list"></div></section>
-        <details class="compose-details"><summary>참가자 추가</summary><form id="participant-form" class="stack form-grid"><label>표시 이름<input name="displayName" maxlength="80" required></label><label>Connection<select name="connectionId" id="participant-connection" required></select></label><label>모델 ID<input name="modelId" value="gemini-2.5-flash" required></label><label>모델 옵션 JSON<textarea name="modelOptions" rows="3" placeholder='{"outputTokens": 1024}'>{}</textarea></label><label class="wide">System Prompt<textarea name="systemPrompt" rows="4" maxlength="20000"></textarea></label><button class="primary" type="submit">OFF 상태로 참가자 추가</button></form></details>
+        <section><h3>Participants</h3><div id="participant-list" class="participant-list"></div></section><details class="compose-details"><summary>관리자 위험 작업</summary><div class="manage-danger"><button id="force-rollover" type="button">불판 강제로 갈기</button><label>Hard Reset 확인<input id="hard-reset-confirm" placeholder="HARD RESET"></label><button id="hard-reset" class="danger" type="button">Hard Reset</button></div></details>
+        <details class="compose-details"><summary>참가자 추가</summary><form id="participant-form" class="stack form-grid"><label>표시 이름<input name="displayName" maxlength="80" required></label><label>Connection<select name="connectionId" id="participant-connection" required></select></label><label>모델 ID<input name="modelId" value="gemini-2.5-flash" required></label><label>추론 강도<input name="reasoningEffort" placeholder="low, medium, high…"></label><label>모델 옵션 JSON<textarea name="modelOptions" rows="3" placeholder='{"outputTokens": 1024}'>{}</textarea></label><label class="wide">System Prompt<textarea name="systemPrompt" rows="4" maxlength="20000"></textarea></label><button class="primary" type="submit">OFF 상태로 참가자 추가</button></form></details>
         <section class="connections"><h3>Connections</h3><div id="connection-list" class="connection-list"></div></section>
         <details class="compose-details"><summary>Connection 추가</summary><form id="connection-form" class="stack form-grid"><label>이름<input name="name" required></label><label>유형<select name="type" id="connection-type"><option value="vertex" selected>Vertex</option><option value="oai-compatible">OAI-compatible</option><option value="custom-api">Custom API</option><option value="codex">Codex (ChatGPT 구독)</option><option value="mock">Mock</option></select></label><label data-vertex>GCP Project<input name="project"></label><label data-vertex>Location<input name="location" value="global"></label><label data-endpoint hidden>Endpoint<input name="endpoint" type="url" placeholder="https://…"></label><label data-context hidden>Context tokens<input name="contextTokens" type="number" min="1024" max="2000000" value="128000"></label><label class="wide" data-credential>인증정보<textarea name="credential" rows="4" autocomplete="off" placeholder="Vertex: 서비스 계정 JSON / OAI: API key"></textarea></label><p class="fine wide" data-codex hidden>Codex는 API 키를 저장하지 않습니다. 저장 후 ChatGPT 로그인으로 인증합니다.</p><button class="primary" type="submit">Connection 저장</button></form></details>
         <div class="demo-callout"><div><strong>데모를 먼저 볼까요?</strong><p>Mock 연결과 비활성 참가자를 만듭니다. Mock은 실제 LLM 호출이 아니라 시뮬레이션입니다.</p></div><button id="demo-add" type="button">데모 추가</button></div>
@@ -74,7 +93,7 @@
     </main>
   </div>
 
-  <dialog id="post-dialog" class="post-dialog"><article><button id="post-dialog-close" class="dialog-close" aria-label="닫기" type="button">×</button><p id="dialog-post-meta" class="eyebrow"></p><h2 id="dialog-post-title"></h2><div id="dialog-post-body" class="post-body"></div></article></dialog>
+  <dialog id="post-dialog" class="post-dialog"><article><button id="post-dialog-close" class="dialog-close" aria-label="닫기" type="button">×</button><p id="dialog-post-meta" class="eyebrow"></p><h2 id="dialog-post-title"></h2><div id="dialog-post-body" class="post-body"></div></article></dialog><dialog id="cycle-dialog" class="post-dialog"><article><button id="cycle-dialog-close" class="dialog-close" aria-label="닫기" type="button">×</button><p class="eyebrow">READ ONLY</p><h2 id="cycle-dialog-title">Cycle 상세</h2><div id="cycle-dialog-body" class="post-body"></div></article></dialog>
   <div id="shutdown-view" class="shutdown-view" hidden><main class="login-card"><p class="eyebrow">SERVER OFF</p><h1>서버를 종료했습니다</h1><p>이 브라우저는 더 이상 Room에 연결되지 않습니다. PC의 로컬 터미널 또는 런처에서 서버를 다시 시작한 뒤 새로고침하세요.</p></main></div>
   <script type="module" src="/app.js"></script>
 </body>

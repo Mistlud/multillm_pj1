@@ -6,6 +6,9 @@ import { resolve } from 'node:path';
 import { RoomStore, WorkerManager, type Connection, type UpdateParticipantInput } from '../core/index.js';
 import { CredentialStore } from './credentials.js';
 import { createAdapterResolver } from '../adapters/index.js';
+import { corePrompts, previewRequest } from '../adapters/prompts.js';
+import { registerSecret, sanitizeError } from '../core/redaction.js';
+import { CorePromptConflictError, CorePromptValidationError } from '../core/prompt-template.js';
 import { CodexManager, type CodexManagerLike } from './codex.js';
 import type { AppConfig } from './config.js';
 
@@ -19,12 +22,12 @@ function record(value: unknown): Record<string, any> {
   return value as Record<string, any>;
 }
 function integer(value: unknown): number { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1) throw new HttpError(400, '번호가 올바르지 않습니다.'); return n; }
-async function body(req: IncomingMessage): Promise<Record<string, any>> {
+async function body(req: IncomingMessage, maxBytes = 256_000): Promise<Record<string, any>> {
   if (!req.headers['content-type']?.startsWith('application/json')) throw new HttpError(415, 'JSON 요청만 지원합니다.');
   const chunks: Buffer[] = []; let length = 0;
   for await (const chunk of req) {
     length += chunk.length;
-    if (length > 256_000) throw new HttpError(413, '요청이 너무 큽니다.');
+    if (length > maxBytes) throw new HttpError(413, '요청이 너무 큽니다.');
     chunks.push(chunk);
   }
   try { return record(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(400, 'JSON 형식이 올바르지 않습니다.'); }
@@ -70,10 +73,11 @@ function connectionValues(input: Record<string, any>, current?: Connection): { n
 }
 
 export function createApp(config: AppConfig, options: { store?: RoomStore; onShutdown?: () => void; codexManager?: CodexManagerLike } = {}) {
+  registerSecret(config.token);
   const store = options.store ?? RoomStore.open({ path: resolve(config.dataDir, 'room.sqlite') });
   const credentials = new CredentialStore(config.dataDir);
   let workers: WorkerManager;
-  const codex = options.codexManager ?? new CodexManager(config.dataDir, { onLoginComplete: (connectionId) => workers.connectionUpdated(connectionId) });
+  const codex = options.codexManager ?? new CodexManager(config.dataDir, { onLoginComplete: (connectionId) => workers.connectionUpdated(connectionId), onAuthError: (connectionId, error) => { try { const detail = error as { details?: unknown; providerCode?: string }; store.recordError({ roomId: 'main', source: 'codex/auth', participantId: null, connectionId, cycleId: null, httpStatus: null, providerCode: detail.providerCode ?? null, message: error instanceof Error ? error.message : String(error), details: detail.details }); } catch { /* Server/store may already be closed. */ } } });
   workers = new WorkerManager(store, { adapters: createAdapterResolver(credentials, { codexManager: codex }) });
   const room = store.getRoom('main') ?? store.createRoom({ id: 'main', name: 'LLM 단톡방' });
   const sessions = new Map<string, number>();
@@ -131,8 +135,42 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       }
       if (url.pathname === '/api/state' && method === 'GET') {
         const current = store.getCurrentThread(room.id)!;
-        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
+        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id).map((participant) => ({ ...participant, cycleState: store.getParticipantCycleState(participant) })), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
       }
+      if (url.pathname === '/api/prompts' && method === 'GET') { json(res, 200, corePrompts(store.getCorePrompt(room.id))); return; }
+      if (url.pathname === '/api/prompts' && method === 'PATCH') {
+        const input = await body(req, 1_300_000);
+        if (typeof input.template !== 'string' || typeof input.expectedTemplate !== 'string') throw new HttpError(400, '공통 프롬프트와 이전 저장 내용을 확인하세요.');
+        try { if (store.setCorePrompt(room.id, input.template, input.expectedTemplate)) workers.roomPromptUpdated(room.id); }
+        catch (error) {
+          if (error instanceof CorePromptConflictError) throw new HttpError(409, error.message);
+          if (error instanceof CorePromptValidationError) throw new HttpError(400, error.message);
+          throw error;
+        }
+        json(res, 200, corePrompts(store.getCorePrompt(room.id))); return;
+      }
+      const previewRoute = /^\/api\/participants\/([^/]+)\/preview$/.exec(url.pathname);
+      if (previewRoute && method === 'GET') {
+        const preview = store.previewParticipant(previewRoute[1]!);
+        if (!preview || preview.participant.roomId !== room.id) throw new HttpError(404, '참가자가 없습니다.');
+        json(res, 200, previewRequest({ participant: preview.participant, input: preview.input, history: [], signal: new AbortController().signal }, preview.connection)); return;
+      }
+      if (url.pathname === '/api/threads/rollover' && method === 'POST') { await body(req); json(res, 200, store.forceRollover(room.id)); return; }
+      if (url.pathname === '/api/threads/delete' && method === 'POST') {
+        const input = await body(req); if (!Array.isArray(input.numbers) || !input.numbers.length || input.numbers.length > 500) throw new HttpError(400, '종료된 불판을 선택하세요.');
+        const numbers = [...new Set(input.numbers.map(integer))];
+        if (numbers.some((n) => store.getThread(room.id, n)?.status !== 'closed')) throw new HttpError(400, '종료된 불판만 삭제할 수 있습니다.');
+        json(res, 200, { deleted: store.deleteThreads(room.id, numbers) }); return;
+      }
+      if (url.pathname === '/api/reset' && method === 'POST') { const input = await body(req); if (input.confirmation !== 'HARD RESET') throw new HttpError(400, 'HARD RESET을 정확히 입력하세요.'); workers.hardReset(room.id); json(res, 200, { ok: true, thread: store.getCurrentThread(room.id) }); return; }
+      const filters = () => ({ participantId: url.searchParams.get('participantId') || undefined, connectionId: url.searchParams.get('connectionId') || undefined, cycleId: url.searchParams.get('cycleId') || undefined, limit: url.searchParams.has('limit') ? integer(url.searchParams.get('limit')) : undefined, beforeId: url.searchParams.has('beforeId') ? integer(url.searchParams.get('beforeId')) : undefined, beforeStartedAt: url.searchParams.has('beforeStartedAt') ? integer(url.searchParams.get('beforeStartedAt')) : undefined });
+      if (url.pathname === '/api/usage' && method === 'GET') { json(res, 200, { records: store.listUsage(room.id, filters()), ...store.getUsageDetails(room.id) }); return; }
+      if (url.pathname === '/api/cycles' && method === 'GET') { json(res, 200, store.listCycles(room.id, filters()).map(({ inputSignature: _signature, serverRunId: _run, ...cycle }) => ({ ...cycle, ...store.getCycleOverview(cycle.id) }))); return; }
+      if (url.pathname.startsWith('/api/cycles/') && method === 'GET') { const detail = store.getCycleDetail(room.id, url.pathname.split('/').at(-1)!); if (!detail) throw new HttpError(404, 'Cycle이 없습니다.'); const { inputSignature: _signature, serverRunId: _run, ...cycle } = detail.cycle; json(res, 200, { ...detail, cycle }); return; }
+      if (url.pathname === '/api/errors' && method === 'GET') { json(res, 200, store.listErrors(room.id, filters())); return; }
+      if (/^\/api\/errors\/\d+$/.test(url.pathname) && method === 'GET') { const error = store.getError(room.id, integer(url.pathname.split('/').at(-1))); if (!error) throw new HttpError(404, '오류 기록이 없습니다.'); json(res, 200, error); return; }
+      if (url.pathname === '/api/errors' && method === 'DELETE') { json(res, 200, { deleted: store.clearErrors(room.id) }); return; }
+      if (url.pathname === '/api/errors' && method === 'POST') { const input = await body(req); const entry = store.recordError({ roomId: room.id, source: 'browser', participantId: null, connectionId: null, cycleId: null, httpStatus: null, providerCode: null, message: string(input.message, '오류 메시지', 32000), details: sanitizeError(input.details) }); json(res, 201, { id: entry.id }); return; }
       if (url.pathname === '/api/res' && method === 'POST') {
         const input = await body(req); const message = string(input.message, '메시지', 20000);
         json(res, 201, store.appendRes({ roomId: room.id, author: { type: 'admin', id: null, displayName: '관리자' }, body: message })); return;
@@ -144,6 +182,7 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       if (url.pathname.startsWith('/api/posts/') && method === 'GET') {
         const post = store.readPost(room.id, integer(url.pathname.split('/').at(-1))); if (!post) throw new HttpError(404, '게시글이 없습니다.'); json(res, 200, post); return;
       }
+      if (/^\/api\/posts\/\d+$/.test(url.pathname) && method === 'DELETE') { if (!store.deletePost(room.id, integer(url.pathname.split('/').at(-1)))) throw new HttpError(404, '게시글이 없습니다.'); json(res, 200, { ok: true }); return; }
       if (url.pathname.startsWith('/api/threads/') && method === 'GET') {
         const thread = store.getThread(room.id, integer(url.pathname.split('/').at(-1))); if (!thread) throw new HttpError(404, '불판이 없습니다.'); json(res, 200, { thread, messages: store.listThreadRes(thread.id) }); return;
       }
@@ -213,7 +252,8 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
         const input = await body(req); const options = record(input.modelOptions ?? {});
         const connectionId = string(input.connectionId, 'Connection'); const connection = store.getConnection(connectionId); if (!connection) throw new HttpError(400, 'Connection이 없습니다.');
         validateOptions(options, connection);
-        const participant = store.addParticipant({ roomId: room.id, displayName: string(input.displayName, '표시 이름', 80), modelId: string(input.modelId, '모델 ID'), connectionId, enabled: false, systemPrompt: typeof input.systemPrompt === 'string' ? input.systemPrompt.slice(0, 20000) : '', modelOptions: options });
+        if ('systemPrompt' in input && (typeof input.systemPrompt !== 'string' || input.systemPrompt.length > 20000)) throw new HttpError(400, 'system prompt를 확인하세요.');
+        const participant = store.addParticipant({ roomId: room.id, displayName: string(input.displayName, '표시 이름', 80), modelId: string(input.modelId, '모델 ID'), connectionId, enabled: false, systemPrompt: input.systemPrompt ?? '', modelOptions: options });
         json(res, 201, participant); return;
       }
       if (url.pathname.startsWith('/api/participants/') && method === 'PATCH') {
@@ -247,11 +287,13 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       throw new HttpError(404, '요청한 경로가 없습니다.');
     } catch (error) {
       if (res.writableEnded || res.destroyed) return;
-      if (error instanceof HttpError) json(res, error.status, { error: error.message });
+      let errorId: number | undefined;
+      try { const parts = (req.url ?? '').split('?')[0]!.split('/'); const participant = parts[2] === 'participants' ? store.getParticipant(parts[3] ?? '') : null; errorId = store.recordError({ roomId: room.id, source: `${req.method ?? 'GET'} ${parts.slice(0, 3).join('/')}`, participantId: participant?.id ?? null, connectionId: participant?.connectionId ?? (parts[2] === 'connections' && store.getConnection(parts[3] ?? '') ? parts[3]! : null), cycleId: null, httpStatus: error instanceof HttpError ? error.status : 500, providerCode: null, message: error instanceof Error ? error.message : String(error), details: null }).id; } catch { /* DB failures must still return the original HTTP failure. */ }
+      if (error instanceof HttpError) json(res, error.status, { error: sanitizeError(error.message), errorId });
       else {
         const message = error instanceof Error ? error.message : '';
-        if (/exceeds|token|message is|required|not found|archive query is invalid/i.test(message)) json(res, 400, { error: /exceeds|token/i.test(message) ? '길이 제한을 초과했습니다. 긴 글은 Big Board를 사용하세요.' : '입력값을 확인하세요.' });
-        else json(res, 500, { error: '요청 처리에 실패했습니다. 서버 상태를 확인하세요.' });
+        if (/exceeds|token|message is|required|not found|archive query is invalid/i.test(message)) json(res, 400, { error: /exceeds|token/i.test(message) ? '길이 제한을 초과했습니다. 긴 글은 Big Board를 사용하세요.' : '입력값을 확인하세요.', errorId });
+        else json(res, 500, { error: '요청 처리에 실패했습니다. 서버 상태를 확인하세요.', errorId });
       }
     }
   });
@@ -266,9 +308,10 @@ function validateOptions(options: Record<string, unknown>, connection?: Connecti
   if (Object.keys(options).some((key) => !allowed.has(key))) throw new HttpError(400, '지원하지 않는 모델 옵션입니다.');
   if ('outputTokens' in options && (!Number.isInteger(options.outputTokens) || Number(options.outputTokens) < 256 || Number(options.outputTokens) > 32768)) throw new HttpError(400, 'outputTokens는 256~32768이어야 합니다.');
   if ('contextTokens' in options && (!Number.isInteger(options.contextTokens) || Number(options.contextTokens) < 1024 || Number(options.contextTokens) > 2_000_000)) throw new HttpError(400, 'contextTokens를 확인하세요.');
-  if ('thinkingLevel' in options && !['LOW','MEDIUM','HIGH'].includes(String(options.thinkingLevel))) throw new HttpError(400, 'thinkingLevel을 확인하세요.');
+  if ('thinkingLevel' in options && (typeof options.thinkingLevel !== 'string' || options.thinkingLevel.length > 200)) throw new HttpError(400, 'thinkingLevel은 텍스트로 입력하세요.');
   if ('mockAction' in options && !['wait','reply'].includes(String(options.mockAction))) throw new HttpError(400, 'mockAction을 확인하세요.');
-  if ('reasoningEffort' in options && !['minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(options.reasoningEffort))) throw new HttpError(400, 'reasoningEffort를 확인하세요.');
+  if ('reasoningEffort' in options && (typeof options.reasoningEffort !== 'string' || options.reasoningEffort.length > 200)) throw new HttpError(400, 'reasoningEffort는 텍스트로 입력하세요.');
+  if ('thinkingLevel' in options && connection?.type !== 'vertex') throw new HttpError(400, 'thinkingLevel은 Vertex Connection에서만 지원합니다.');
   if (connection?.type === 'codex') {
     if ('outputTokens' in options || 'contextTokens' in options || 'thinkingLevel' in options || 'mockAction' in options) throw new HttpError(400, 'Codex는 reasoningEffort만 지원합니다.');
   } else if ('reasoningEffort' in options) throw new HttpError(400, 'reasoningEffort는 Codex Connection에서만 지원합니다.');

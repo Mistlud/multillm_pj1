@@ -1,12 +1,30 @@
 import type { ParticipantAction } from "./types.js";
 
+/** Records field diagnostics without retaining the response body or memo. */
+export class UnknownActionFieldError extends Error {
+  readonly details: Record<string, unknown>;
+  constructor(value: Record<string, unknown>, allowed: string[]) {
+    const received = Object.keys(value);
+    const rejected = received.filter((key) => !allowed.includes(key));
+    super(`unknown action field: ${rejected[0]}`);
+    this.name = "UnknownActionFieldError";
+    this.details = { action: value.action, receivedFields: received, allowedFields: [...allowed], rejectedFields: rejected };
+    if (Object.hasOwn(value, "thread")) {
+      const thread = value.thread;
+      const type = thread === null ? "null" : Array.isArray(thread) ? "array" : typeof thread;
+      const scalar = thread === null || ["string", "number", "boolean"].includes(typeof thread);
+      this.details.thread = { value: scalar ? thread : "[non-scalar value omitted]", type };
+    }
+  }
+}
+
 function object(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("action must be an object");
   return value as Record<string, unknown>;
 }
 
 function keysOnly(value: Record<string, unknown>, allowed: string[]): void {
-  for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`unknown action field: ${key}`);
+  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new UnknownActionFieldError(value, allowed);
 }
 
 function string(value: unknown, field: string, allowEmpty = false): string {

@@ -7,3 +7,4 @@ data/
 !.env.example
 credentials/
 *.tsbuildinfo
+/prompt.txt

@@ -9,6 +9,7 @@ import type { SpawnOptionsWithoutStdio } from 'node:child_process';
 import { CodexManager, type CodexChild, type CodexManagerLike } from '../src/server/codex.js';
 import { CodexAdapter } from '../src/adapters/codex.js';
 import { AdapterError, RoomStore, WorkerManager, type AdapterRequest, type Connection } from '../src/core/index.js';
+import { previewRequest } from '../src/adapters/prompts.js';
 
 type Message = { id?: number; method: string; params: any };
 class FakeChild extends EventEmitter implements CodexChild {
@@ -61,6 +62,13 @@ function fixture(options: { account?: string; config?: (value: any) => void; thr
   });
   return { manager, connection, children, spawns, dir, async close() { await manager.stop(); rmSync(dir, { recursive: true, force: true }); } };
 }
+
+test('codex management preview matches RPC inputs and omits blank effort', async () => {
+  const f = fixture(); const store = RoomStore.open({ path: ':memory:' }); const room = store.createRoom({ name: 'room' }); const participant = store.addParticipant({ roomId: room.id, displayName: 'A', modelId: 'explicit-model', systemPrompt: 'custom', modelOptions: { reasoningEffort: '' } }); const snapshot = store.previewParticipant(participant.id)!; const request: AdapterRequest = { participant, input: snapshot.input, history: [], signal: new AbortController().signal };
+  try { const preview: any = previewRequest(request, f.connection); const adapter = new CodexAdapter(f.connection, f.manager); await adapter.run(request); const child = f.children[0]!; const start = child.messages.find((message) => message.method === 'thread/start')!.params; const turn = child.messages.find((message) => message.method === 'turn/start')!.params;
+    assert.equal(start.baseInstructions, preview.transport.thread.baseInstructions); assert.equal(start.developerInstructions, undefined); assert.deepEqual(turn.input, preview.transport.turn.input); assert.equal('effort' in turn, false); request.participant.modelOptions.reasoningEffort = 'extra high'; await adapter.run(request); assert.equal(child.messages.filter((message) => message.method === 'turn/start').at(-1)!.params.effort, 'extra high'); await adapter.dispose();
+  } finally { store.close(); await f.close(); }
+});
 
 test('codex isolates environment, instructions and tools and collects only each turn answer', async () => {
   const f = fixture({ turns: ['{"action":"read_post","postId":1}', '{"action":"wait"}'] });

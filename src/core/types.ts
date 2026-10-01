@@ -33,6 +33,7 @@ export interface Thread {
   resCount: number;
   createdAt: number;
   closedAt: number | null;
+  deletedAt: number | null;
 }
 
 export interface PublicRes {
@@ -54,6 +55,7 @@ export interface Post {
   title: string;
   body: string;
   createdAt: number;
+  deletedAt: number | null;
 }
 
 export interface Cursor {
@@ -120,6 +122,11 @@ export interface UsageRecord {
   inputTokens: number | null;
   outputTokens: number | null;
   cachedInputTokens: number | null;
+  reasoningTokens?: number | null;
+  participantName?: string | null;
+  connectionName?: string | null;
+  connectionType?: string | null;
+  simulated?: boolean;
   providerUsage: Record<string, unknown> | null;
   createdAt: number;
 }
@@ -130,6 +137,11 @@ export interface UsageSummary {
   outputTokens: number;
   cachedInputTokens: number;
 }
+export interface UsageAggregate { id: Id; displayName: string | null; type?: string | null; calls: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; reasoningTokens: number | null; simulated: boolean; }
+export interface UsageDetails { participants: UsageAggregate[]; connections: UsageAggregate[]; }
+export interface CycleEvent { id: number; cycleId: Id; kind: 'started' | 'read' | 'final' | 'completed' | 'failed'; payload: Record<string, unknown> | null; createdAt: number; }
+export interface CycleDetail { cycle: Cycle; events: CycleEvent[]; usage: UsageRecord[]; result: { resId: number | null; postId: number | null } | null; }
+export interface ErrorRecord { id: number; roomId: Id; source: string; participantId: Id | null; connectionId: Id | null; cycleId: Id | null; httpStatus: number | null; providerCode: string | null; message: string; details: unknown; createdAt: number; }
 
 export interface CycleSnapshot {
   threadId: Id;
@@ -220,12 +232,15 @@ export interface AdapterUsage {
   inputTokens?: number;
   outputTokens?: number;
   cachedInputTokens?: number;
+  reasoningTokens?: number | null;
   raw?: Record<string, unknown>;
 }
 
 export interface ModelInput {
   participantName: string;
   systemPrompt: string;
+  /** Common prompt captured when the cycle/preview starts. */
+  corePrompt?: string;
   privateMemo: string;
   currentThread: {
     id: Id;
@@ -233,7 +248,7 @@ export interface ModelInput {
     latestResNumber: number;
     isRolloverSinceObserved: boolean;
     newlyObservedAfter: number;
-    messages: Array<{ thread: number; res: number; author: string; content: string }>;
+    messages: Array<{ thread: number; res: number; author: string; content: string; createdAt: number }>;
     postReferences: Array<{ id: number; title: string; author: string }>;
   };
 }
@@ -274,13 +289,19 @@ export class AdapterError extends Error {
   readonly permanent: boolean;
   readonly usage: AdapterUsage | undefined;
   readonly inputBlocked: boolean;
-  constructor(message: string, options: { retryAfterMs?: number | null; permanent?: boolean; usage?: AdapterUsage; inputBlocked?: boolean } = {}) {
+  readonly httpStatus: number | null;
+  readonly providerCode: string | null;
+  readonly details: unknown;
+  constructor(message: string, options: { retryAfterMs?: number | null; permanent?: boolean; usage?: AdapterUsage; inputBlocked?: boolean; httpStatus?: number | null; providerCode?: string | null; details?: unknown } = {}) {
     super(message);
     this.name = "AdapterError";
     this.retryAfterMs = options.retryAfterMs ?? null;
     this.permanent = options.permanent ?? false;
     this.usage = options.usage;
     this.inputBlocked = options.inputBlocked ?? false;
+    this.httpStatus = options.httpStatus ?? null;
+    this.providerCode = options.providerCode ?? null;
+    this.details = options.details;
   }
 }
 

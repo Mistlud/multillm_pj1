@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { registerSecret } from '../core/redaction.js';
 
 // Windows DPAPI binds encrypted credentials to the current Windows user.
 // Base64 on stdin/stdout avoids PowerShell console encoding changing UTF-8 secrets.
@@ -9,6 +10,7 @@ export class CredentialStore {
   private dir: string;
   constructor(dataDir: string) { this.dir = join(dataDir, 'credentials'); mkdirSync(this.dir, { recursive: true }); }
   async save(secret: string): Promise<string> {
+    registerSecret(secret);
     if (process.platform !== 'win32') throw new Error('Credential protection currently requires Windows DPAPI');
     if (secret.length > 100_000) throw new Error('Credential is too large');
     const id = randomUUID();
@@ -20,7 +22,7 @@ export class CredentialStore {
     if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error('Invalid credential reference');
     const path = join(this.dir, `${id}.dpapi`);
     if (!existsSync(path)) throw new Error('Credential not found');
-    return this.protect(readFileSync(path, 'utf8'), true);
+    const secret = await this.protect(readFileSync(path, 'utf8'), true); registerSecret(secret); return secret;
   }
   /** Removes only a credential created for a request that could not be committed. */
   delete(id: string): void {
