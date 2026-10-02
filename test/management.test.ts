@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+import { transpile } from 'typescript';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { RoomStore, WorkerManager } from '../src/core/index.js';
@@ -10,6 +12,70 @@ import { registerSecret } from '../src/core/redaction.js';
 import { createApp } from '../src/server/app.js';
 import { CodexAdapter } from '../src/adapters/codex.js';
 import { previewRequest, vertexRequest, CODEX_PREVIEW_NOTE, CODEX_DEVELOPER_INSTRUCTIONS } from '../src/adapters/prompts.js';
+
+test('deleted memo view does not restore cleared content after failed refresh or stale responses', async () => {
+  const source = readFileSync(new URL('../src/web/app.ts', import.meta.url), 'utf8');
+  const memoCode = source.slice(source.indexOf('function renderMemos()'), source.indexOf('function renderManagement()'));
+  const resetCode = source.slice(source.indexOf('function resetDeletedMemos()'), source.indexOf('function showLogin()'));
+  class Node {
+    children: any[] = []; textContent = ''; checked = false;
+    append(...items: any[]) { this.children.push(...items); }
+    addEventListener() {}
+  }
+  const list = new Node(), appView = { hidden: false }, errors: string[] = [];
+  const memo = { participantId: 'deleted', displayName: 'Old member', privateMemo: 'old secret memo', deletedAt: 1, updatedAt: 1 };
+  let getCalls = 0, deleteCalls = 0;
+  let request = async (_path: string, options?: any): Promise<any> => {
+    if (options?.method === 'DELETE') { deleteCalls++; return { ok: true }; }
+    getCalls++; throw new Error('memo fetch unavailable');
+  };
+  const ui = runInNewContext(transpile(`
+    let state = { participantMemos: [] }, activeTab = 'memos', memoFingerprint = '';
+    let deletedMemos = [memo], deletedMemoStateVersion = 1, memoStateVersion = 1, memoRequestSequence = 0;
+    let deletedMemosLoading = false, showDeletedMemos = true, memoContextVersion = 0, memoFailedStateVersion = -1;
+    const deletingMemoIds = new Set();
+    ${memoCode}
+    ${resetCode}
+    ({ renderMemos, clearDeletedMemo, resetDeletedMemos, loadDeletedMemos,
+       inspect: () => ({ deletedMemos, showDeletedMemos, deleting: deletingMemoIds.size }),
+       seed: () => { deletedMemos = [memo]; deletedMemoStateVersion = memoStateVersion; showDeletedMemos = true; memoFingerprint = ''; },
+       nextPoll: () => renderMemos(),
+       reenter: () => { invalidateDeletedMemos(); renderMemos(); } })
+  `), {
+    memo, appView, Date, Set, window: { confirm: () => true }, document: { createTextNode: (value: string) => value },
+    $: () => list, make: () => new Node(), text: (node: Node, value: unknown) => { node.textContent = String(value); },
+    clear: (node: Node) => { node.children = []; }, fmtTime: () => 'time',
+    showError: (message: string) => errors.push(message), api: (path: string, options?: any) => request(path, options),
+    refresh: async () => { throw new Error('state refresh unavailable'); },
+  });
+  const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const rendered = (node: any): string => typeof node === 'string' ? node : node.textContent + (node.children ?? []).map(rendered).join('');
+
+  await ui.clearDeletedMemo(memo); await settle();
+  assert.equal(deleteCalls, 1); assert.equal(getCalls, 1);
+  assert.equal(ui.inspect().deletedMemos.length, 0); assert.equal(rendered(list).includes(memo.privateMemo), false);
+  ui.renderMemos(); await settle(); assert.equal(getCalls, 1, 'failed GET must not cause an immediate retry loop');
+  ui.nextPoll(); await settle(); assert.equal(getCalls, 1, 'periodic state polling must not fetch deleted memos');
+  ui.reenter(); await settle(); assert.equal(getCalls, 2, 'tab reentry may retry');
+
+  let rejectDelete!: (reason: Error) => void;
+  request = () => new Promise((_resolve, reject) => { rejectDelete = reject; });
+  ui.seed(); const pendingDelete = ui.clearDeletedMemo(memo); const errorCount = errors.length;
+  ui.resetDeletedMemos(); appView.hidden = true; rejectDelete(new Error('late DELETE failure')); await pendingDelete;
+  assert.equal(ui.inspect().deletedMemos.length, 0); assert.equal(ui.inspect().showDeletedMemos, false);
+  assert.equal(ui.inspect().deleting, 0); assert.equal(errors.length, errorCount); assert.equal(rendered(list), '');
+
+  let resolveGet!: (value: any) => void;
+  request = () => new Promise((resolve) => { resolveGet = resolve; });
+  appView.hidden = false; ui.seed(); const pendingGet = ui.loadDeletedMemos();
+  ui.nextPoll(); resolveGet([memo]); await pendingGet;
+  assert.equal(ui.inspect().deletedMemos.length, 1, 'polling must not invalidate an event-triggered request');
+  const firstNode = list.children[0]; ui.nextPoll(); await settle();
+  assert.equal(list.children[0], firstNode, 'unchanged memo contents must retain their DOM on polling');
+  const staleGet = ui.loadDeletedMemos(); ui.resetDeletedMemos(); resolveGet([memo]); await staleGet;
+  assert.equal(ui.inspect().deletedMemos.length, 0); assert.equal(ui.inspect().showDeletedMemos, false);
+  assert.equal(rendered(list).includes(memo.privateMemo), false);
+});
 
 test('management preview is read-only, follows adapter input, and reasoning remains exact or omitted', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'llm-management-')); const store = RoomStore.open({ path: ':memory:' }); const token = 'local-test-token-'.repeat(3); let calls = 0; let baseInstructions = ''; let turnInput = ''; let actualEffort: unknown;

@@ -61,36 +61,70 @@ test('codex connections accept subscription settings and reject API credentials'
   }
 });
 
-test('private memo state includes deleted participants only within the authenticated room', async () => {
+test('private memo deletion only clears a deleted participant current memo', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'llm-room-memo-'));
-  const store = RoomStore.open({ path: ':memory:' });
+  const store = RoomStore.open({ path: join(dataDir, 'room.sqlite') });
   const token = 't'.repeat(32);
   const app = createApp({ dataDir, token, host: '127.0.0.1', port: 4317 }, { store });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');
   const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+  const call = (path: string, method = 'GET', value?: unknown, extra: Record<string, string> = {}) => fetch(base + path, { method, headers: { Authorization: `Bearer ${token}`, ...(value === undefined ? {} : { 'Content-Type': 'application/json' }), ...extra }, body: value === undefined ? undefined : JSON.stringify(value) });
   try {
     const active = store.addParticipant({ roomId: 'main', displayName: 'current', modelId: 'mock', enabled: false, privateMemo: 'first line\nsecond line' });
-    const removed = store.addParticipant({ roomId: 'main', displayName: 'removed', modelId: 'mock', enabled: false, privateMemo: 'retained private memo' });
+    const connection = store.addConnection({ name: 'removed connection', type: 'mock' });
+    const removed = store.addParticipant({ roomId: 'main', displayName: 'removed', modelId: 'mock', connectionId: connection.id, privateMemo: 'retained private memo' });
     const empty = store.addParticipant({ roomId: 'main', displayName: 'empty', modelId: 'mock', enabled: false });
+    const post = store.appendPostWithReference({ roomId: 'main', author: { type: 'participant', id: removed.id, displayName: 'spoofed' }, title: 'preserved post', body: 'preserved post body', message: 'post reference' }).post;
+    store.appendRes({ roomId: 'main', author: { type: 'admin', id: null, displayName: 'admin' }, body: 'cycle input' });
+    const claim = store.claimCycle({ participantId: removed.id, serverRunId: app.workers.serverRunId })!;
+    store.recordUsage({ participantId: removed.id, connectionId: connection.id, cycleId: claim.cycle.id, participantName: 'removed', connectionName: 'removed connection', connectionType: 'mock', inputTokens: 12, outputTokens: 8 });
+    store.completeCycle({ cycleId: claim.cycle.id, serverRunId: app.workers.serverRunId, action: { action: 'wait' } });
+    const before = { post: store.readPost('main', post.id), usage: store.getUsageSummary({ roomId: 'main' }), signature: store.getCycleDetail('main', claim.cycle.id)!.cycle.inputSignature };
     store.deleteParticipant(removed.id);
+    store.deleteConnection(connection.id);
     store.createRoom({ id: 'other', name: 'other room' });
     const other = store.addParticipant({ roomId: 'other', displayName: 'other', modelId: 'mock', enabled: false, privateMemo: 'other room secret' });
     store.deleteParticipant(other.id);
     assert.equal((await fetch(`${base}/api/state`)).status, 401);
-    const response = await fetch(`${base}/api/state`, { headers: { Authorization: `Bearer ${token}` } });
+    const response = await call('/api/state');
     assert.equal(response.status, 200);
     const state = await response.json() as any;
     const memos = new Map<string, any>(state.participantMemos.map((memo: any) => [memo.participantId, memo]));
-    assert.equal(memos.size, 3);
+    assert.equal(memos.size, 2);
     assert.equal(memos.get(active.id).privateMemo, 'first line\nsecond line');
     assert.equal(memos.get(active.id).deletedAt, null);
     assert.equal(memos.get(empty.id).privateMemo, '');
-    assert.equal(memos.get(removed.id).privateMemo, 'retained private memo');
-    assert.equal(typeof memos.get(removed.id).deletedAt, 'number');
-    assert.deepEqual(Object.keys(memos.get(removed.id)).sort(), ['deletedAt', 'displayName', 'participantId', 'privateMemo', 'updatedAt']);
+    assert.equal(memos.has(removed.id), false);
+    assert.equal(JSON.stringify(state).includes('retained private memo'), false);
     assert.equal(state.participants.some((p: any) => p.id === removed.id), false);
     assert.equal(store.listParticipantsForScheduling().some((p) => p.id === removed.id || p.id === other.id), false);
     assert.equal(JSON.stringify(state).includes('other room secret'), false);
+    assert.equal((await call(`/api/participants/${removed.id}/memo`, 'DELETE', undefined, { Authorization: '' })).status, 401);
+    assert.equal((await call(`/api/participants/${removed.id}/memo`, 'DELETE', undefined, { Origin: 'https://untrusted.example' })).status, 403);
+    assert.equal((await call(`/api/participants/${active.id}/memo`, 'DELETE')).status, 409);
+    assert.equal((await call(`/api/participants/${other.id}/memo`, 'DELETE')).status, 404);
+    const deletedMemos = await (await call('/api/participant-memos?includeDeleted=1')).json() as any[];
+    const deletedMemo = deletedMemos.find((memo) => memo.participantId === removed.id)!;
+    assert.equal(deletedMemo.privateMemo, 'retained private memo');
+    assert.equal(typeof deletedMemo.deletedAt, 'number');
+    assert.equal(JSON.stringify(deletedMemos).includes('other room secret'), false);
+    assert.equal((await call(`/api/participants/${removed.id}/memo`, 'DELETE')).status, 200);
+    assert.equal(store.listParticipantMemos('main', true).find((memo) => memo.participantId === removed.id)?.privateMemo, '');
+    assert.deepEqual({ post: store.readPost('main', post.id), usage: store.getUsageSummary({ roomId: 'main' }), signature: store.getCycleDetail('main', claim.cycle.id)!.cycle.inputSignature }, before);
+    const usage = await (await call('/api/usage')).json() as any;
+    assert.equal(usage.records[0].participantDeleted, true); assert.equal(usage.records[0].connectionDeleted, true);
+    assert.equal(usage.participants.find((item: any) => item.id === removed.id).deleted, true);
+    assert.equal(usage.connections.find((item: any) => item.id === connection.id).deleted, true);
+    const cycles = await (await call('/api/cycles')).json() as any[];
+    assert.equal(cycles.find((cycle) => cycle.id === claim.cycle.id).participantDeleted, true);
+    assert.equal(cycles.find((cycle) => cycle.id === claim.cycle.id).participantName, 'removed');
+    assert.deepEqual(cycles.find((cycle) => cycle.id === claim.cycle.id).connection, { id: connection.id, displayName: 'removed connection', type: 'mock', deleted: true });
+    const cycleDetail = await (await call(`/api/cycles/${claim.cycle.id}`)).json() as any;
+    assert.equal(cycleDetail.cycle.participantDeleted, true);
+    assert.equal(cycleDetail.cycle.participantName, 'removed');
+    assert.deepEqual(cycleDetail.connection, { id: connection.id, displayName: 'removed connection', type: 'mock', deleted: true });
+    assert.equal('inputSignature' in cycleDetail.cycle, false);
+    assert.equal(JSON.stringify(cycleDetail).includes('retained private memo'), false);
   } finally {
     const closed = once(app.server, 'close'); app.shutdown(); await closed; store.close(); rmSync(dataDir, { recursive: true, force: true });
   }

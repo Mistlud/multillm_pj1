@@ -137,6 +137,7 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
         const current = store.getCurrentThread(room.id)!;
         json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id).map((participant) => ({ ...participant, cycleState: store.getParticipantCycleState(participant) })), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
       }
+      if (url.pathname === '/api/participant-memos' && method === 'GET') { json(res, 200, store.listParticipantMemos(room.id, url.searchParams.get('includeDeleted') === '1')); return; }
       if (url.pathname === '/api/prompts' && method === 'GET') { json(res, 200, corePrompts(store.getCorePrompt(room.id))); return; }
       if (url.pathname === '/api/prompts' && method === 'PATCH') {
         const input = await body(req, 1_300_000);
@@ -271,6 +272,17 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
         if ('enabled' in input) { if (typeof input.enabled !== 'boolean') throw new HttpError(400, 'enabled는 boolean이어야 합니다.'); workers.setEnabled(id, input.enabled); }
         else if (participant.enabled) workers.schedule(id);
         json(res, 200, store.getParticipant(id)); return;
+      }
+      const participantMemoRoute = /^\/api\/participants\/([^/]+)\/memo$/.exec(url.pathname);
+      if (participantMemoRoute && method === 'DELETE') {
+        try { store.deleteDeletedParticipantMemo(room.id, participantMemoRoute[1]!); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : '';
+          if (/not found/.test(message)) throw new HttpError(404, '삭제된 참가자가 없습니다.');
+          if (/not deleted/.test(message)) throw new HttpError(409, '삭제된 참가자의 메모만 비울 수 있습니다.');
+          throw error;
+        }
+        json(res, 200, { ok: true }); return;
       }
       if (url.pathname.startsWith('/api/participants/') && method === 'DELETE') {
         const id = url.pathname.split('/').at(-1)!; const participant = store.getParticipant(id);

@@ -28,10 +28,13 @@ let state: State | null = null;
 let activeTab = "room";
 let refreshTimer: number | undefined;
 let roomFingerprint = "", boardFingerprint = "", memoFingerprint = "", manageFingerprint = "";
-let promptFingerprint = '', promptsLoading = false;
+let promptsLoading = false;
 let savedCorePrompt: string | undefined, latestCorePrompt: string | undefined, promptSaving = false;
 let editingConnectionId: string | null = null;
 const deletingConnectionIds = new Set<string>();
+let deletedMemos: ParticipantMemo[] = [], deletedMemoStateVersion = -1, memoStateVersion = 0, memoRequestSequence = 0, deletedMemosLoading = false, showDeletedMemos = false;
+let memoContextVersion = 0, memoFailedStateVersion = -1;
+const deletingMemoIds = new Set<string>();
 const deletingParticipantIds = new Set<string>();
 const codexLoginUrls = new Map<string, string>();
 const codexStatusRequests = new Set<string>();
@@ -54,7 +57,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 async function loadState(): Promise<void> {
   const next = await api<State>("/api/state");
-  if (state && state.thread.id !== next.thread.id && next.thread.number === 1) { roomEpoch++; archiveRequestSequence++; usageRequestSequence++; cycleRequestSequence++; archiveQuery = ''; archiveDetail = null; archiveSearchActive = false; archiveFingerprint = ''; usageBefore = cycleBefore = errorBefore = undefined; if (postDialog.open) postDialog.close(); if (cycleDialog.open) cycleDialog.close(); clear($('archive-result')); }
+  if (state && state.thread.id !== next.thread.id && next.thread.number === 1) { roomEpoch++; resetDeletedMemos(); archiveRequestSequence++; usageRequestSequence++; cycleRequestSequence++; archiveQuery = ''; archiveDetail = null; archiveSearchActive = false; archiveFingerprint = ''; usageBefore = cycleBefore = errorBefore = undefined; if (postDialog.open) postDialog.close(); if (cycleDialog.open) cycleDialog.close(); clear($('archive-result')); }
   if (postDialog.open) { const post = next.posts.find((item) => String(item.id) === postDialog.dataset.postId); if (post?.deletedAt != null) { text($('dialog-post-title'), post.title); text($('dialog-post-body'), '관리자에 의해 삭제된 게시글입니다.'); } }
   if (postDialog.open && postDialog.dataset.postId) void refreshOpenPost(postDialog.dataset.postId);
   state = next; roomName.textContent = next.room.name; $("res-limit").textContent = `공통 한도 ${next.limits.messageTokens} tokens`;
@@ -85,6 +88,10 @@ function renderRoom(): void {
   roomFingerprint = fingerprint; clear(messages);
   for (const message of state.messages) messages.append(createMessage(message));
   if (wasNearBottom) messages.scrollTop = messages.scrollHeight;
+}
+
+function scrollRoomToLatest(): void {
+  if (activeTab === 'room' && !appView.hidden) messages.scrollTop = messages.scrollHeight;
 }
 
 function createMessage(message: Message, archive = false): HTMLElement {
@@ -142,16 +149,44 @@ async function searchArchive(): Promise<void> {
 }
 
 function renderMemos(): void {
-  if (!state) return;
-  const fingerprint = JSON.stringify(state.participantMemos); if (fingerprint === memoFingerprint) return;
+  if (!state || activeTab !== 'memos' || appView.hidden) return;
+  const staleDeletedMemos = showDeletedMemos && deletedMemoStateVersion !== memoStateVersion;
+  const shown = showDeletedMemos && !staleDeletedMemos ? [...state.participantMemos, ...deletedMemos] : state.participantMemos;
+  const retryDeletedMemos = staleDeletedMemos && memoFailedStateVersion !== memoStateVersion;
+  const fingerprint = JSON.stringify({ shown, showDeletedMemos, staleDeletedMemos, retryDeletedMemos, deletedMemosLoading, deleting: [...deletingMemoIds] }); if (fingerprint === memoFingerprint) return;
   memoFingerprint = fingerprint; const list = $("memo-list"); clear(list);
-  if (!state.participantMemos.length) { const empty = make("p", "muted"); text(empty, "표시할 Private Memo가 없습니다."); list.append(empty); return; }
-  for (const memo of state.participantMemos) {
+  const controls = make('label', 'memo-toggle'); const toggle = make('input') as HTMLInputElement; toggle.type = 'checkbox'; toggle.checked = showDeletedMemos; toggle.addEventListener('change', () => { showDeletedMemos = toggle.checked; invalidateDeletedMemos(); renderMemos(); }); controls.append(toggle, document.createTextNode(' 삭제된 참가자 메모 표시')); list.append(controls);
+  if (!shown.length) { const empty = make("p", "muted"); text(empty, "표시할 Private Memo가 없습니다."); list.append(empty); }
+  for (const memo of shown) {
     const card = make("article", "memo-card"); const name = make("h3"); text(name, memo.displayName);
     const meta = make("p", "fine"); text(meta, memo.deletedAt === null ? `현재 참가자 · 최종 갱신 ${fmtTime(memo.updatedAt)}` : `삭제됨 · 삭제 ${fmtTime(memo.deletedAt)}`);
-    const body = make("div", `memo-body${memo.privateMemo ? "" : " muted"}`); text(body, memo.privateMemo || "(비어 있음)"); card.append(name, meta, body); list.append(card);
+    const body = make("div", `memo-body${memo.privateMemo ? "" : " muted"}`); text(body, memo.privateMemo || "(비어 있음)"); card.append(name, meta, body);
+    if (memo.deletedAt !== null && memo.privateMemo) { const remove = make('button', 'danger'); remove.type = 'button'; remove.disabled = deletingMemoIds.has(memo.participantId); text(remove, remove.disabled ? '삭제 중…' : '현재 메모 비우기'); remove.addEventListener('click', () => void clearDeletedMemo(memo)); card.append(remove); }
+    list.append(card);
+  }
+  if (retryDeletedMemos && !deletedMemosLoading && !deletingMemoIds.size) void loadDeletedMemos();
+}
+function invalidateDeletedMemos(): void {
+  memoRequestSequence++; memoStateVersion++; deletedMemoStateVersion = -1; memoFailedStateVersion = -1; deletedMemosLoading = false; memoFingerprint = '';
+}
+async function clearDeletedMemo(memo: ParticipantMemo): Promise<void> {
+  if (deletingMemoIds.has(memo.participantId) || !window.confirm('현재 보존 메모만 삭제하며 과거 Cycle 기록은 유지됩니다. 이 메모를 비울까요?')) return;
+  const context = memoContextVersion;
+  deletingMemoIds.add(memo.participantId); invalidateDeletedMemos();
+  deletedMemos = []; renderMemos();
+  try {
+    await api(`/api/participants/${memo.participantId}/memo`, { method: 'DELETE' });
+    if (context !== memoContextVersion || appView.hidden) return;
+    await refresh();
+  } catch (error) {
+    if (context === memoContextVersion && !appView.hidden) showError(error instanceof Error ? error.message : '현재 메모를 비우지 못했습니다.');
+  } finally {
+    if (context === memoContextVersion) {
+      deletingMemoIds.delete(memo.participantId); invalidateDeletedMemos(); renderMemos();
+    }
   }
 }
+async function loadDeletedMemos(): Promise<void> { const request = ++memoRequestSequence, version = memoStateVersion; deletedMemosLoading = true; memoFingerprint = ''; renderMemos(); try { const memos = await api<ParticipantMemo[]>('/api/participant-memos?includeDeleted=1'); if (request !== memoRequestSequence || version !== memoStateVersion || !showDeletedMemos) return; deletedMemos = memos.filter((memo) => memo.deletedAt !== null); deletedMemoStateVersion = version; memoFailedStateVersion = -1; } catch (error) { if (request === memoRequestSequence && version === memoStateVersion && showDeletedMemos) { memoFailedStateVersion = version; showError(error instanceof Error ? error.message : '삭제된 참가자 메모를 불러오지 못했습니다.'); } } finally { if (request === memoRequestSequence) { deletedMemosLoading = false; memoFingerprint = ''; renderMemos(); } } }
 
 function renderManagement(): void {
   if (!state) return;
@@ -256,10 +291,11 @@ function renderLan(): void { if (!state) return; const list = $("lan-addresses")
 
 async function openPost(id: string): Promise<void> { const epoch = roomEpoch; try { const post = await api<Post>(`/api/posts/${id}`); if (epoch !== roomEpoch) return; postDialog.dataset.postId = id; text($("dialog-post-meta"), `P${post.id} · ${post.author.displayName} · ${fmtTime(post.createdAt)}`); text($("dialog-post-title"), post.title); text($("dialog-post-body"), post.body); postDialog.showModal(); } catch (error) { showError(error instanceof Error ? error.message : "게시글을 열 수 없습니다."); } }
 async function refreshOpenPost(id: string): Promise<void> { try { const post = await api<Post>(`/api/posts/${id}`); if (postDialog.open && postDialog.dataset.postId === id) { text($('dialog-post-title'), post.title); text($('dialog-post-body'), post.body); } } catch { if (postDialog.open && postDialog.dataset.postId === id) postDialog.close(); } }
-function setTab(tab: string): void { activeTab = tab; for (const button of document.querySelectorAll<HTMLButtonElement>(".tab")) button.classList.toggle("active", button.dataset.tab === tab); for (const panel of document.querySelectorAll<HTMLElement>(".tab-panel")) { const active = panel.id === `tab-${tab}`; panel.hidden = !active; panel.classList.toggle("active", active); } hideError(); renderActive(); if (tab === 'prompts') void renderPrompts(); }
+function setTab(tab: string): void { activeTab = tab; for (const button of document.querySelectorAll<HTMLButtonElement>(".tab")) button.classList.toggle("active", button.dataset.tab === tab); for (const panel of document.querySelectorAll<HTMLElement>(".tab-panel")) { const active = panel.id === `tab-${tab}`; panel.hidden = !active; panel.classList.toggle("active", active); } hideError(); if (tab === 'memos') invalidateDeletedMemos(); renderActive(); scrollRoomToLatest(); if (tab === 'prompts') void renderPrompts(); }
 async function refresh(): Promise<void> { try { await loadState(); hideError(); } catch (error) { if (error instanceof Error && /로그인|접속 토큰|401/.test(error.message)) showLogin(); else { $("connection-state").textContent = "연결 재시도 중"; showError(error instanceof Error ? error.message : "새 정보를 가져오지 못했습니다."); } } }
-function showLogin(): void { if (refreshTimer) window.clearInterval(refreshTimer); resetConnectionEditing(); manageFingerprint = ""; appView.hidden = true; loginView.hidden = false; loginToken.focus(); }
-function showApp(): void { loginView.hidden = true; appView.hidden = false; if (activeTab === 'prompts') void renderPrompts(); if (refreshTimer) window.clearInterval(refreshTimer); refreshTimer = window.setInterval(() => void refresh(), 4000); }
+function resetDeletedMemos(): void { memoContextVersion++; invalidateDeletedMemos(); deletedMemos = []; showDeletedMemos = false; deletingMemoIds.clear(); clear($('memo-list')); }
+function showLogin(): void { if (refreshTimer) window.clearInterval(refreshTimer); resetConnectionEditing(); resetDeletedMemos(); manageFingerprint = ""; appView.hidden = true; loginView.hidden = false; loginToken.focus(); }
+function showApp(): void { loginView.hidden = true; appView.hidden = false; scrollRoomToLatest(); if (activeTab === 'prompts') void renderPrompts(); if (refreshTimer) window.clearInterval(refreshTimer); refreshTimer = window.setInterval(() => void refresh(), 4000); }
 
 loginForm.addEventListener("submit", async (event) => { event.preventDefault(); hideError(true); const token = loginToken.value; try { await api("/api/login", { method: "POST", body: JSON.stringify({ token }) }); loginToken.value = ""; showApp(); await refresh(); } catch (error) { loginToken.value = ""; showError(error instanceof Error ? error.message : "로그인에 실패했습니다.", true); } });
 resForm.addEventListener("submit", async (event) => { event.preventDefault(); if (!resMessage.value.trim()) return; try { await api("/api/res", { method: "POST", body: JSON.stringify({ message: resMessage.value }) }); resMessage.value = ""; await refresh(); } catch (error) { showError(error instanceof Error ? error.message : "레스 저장에 실패했습니다."); } });
@@ -365,13 +401,6 @@ function applyCorePrompts(prompts: CorePromptRecord[], replaceDraft = false): vo
     savedCorePrompt = common.text;
     corePromptEditor.value = common.text;
   }
-  const fixed = prompts.filter((item) => item.adapter !== 'all');
-  const fingerprint = JSON.stringify(fixed);
-  if (fingerprint !== promptFingerprint) {
-    const list = $('prompt-list'); clear(list);
-    for (const prompt of fixed) record(list, prompt.name, prompt.text);
-    promptFingerprint = fingerprint;
-  }
 }
 async function renderPrompts(): Promise<void> {
   if (promptsLoading || promptSaving) return;
@@ -450,26 +479,26 @@ async function showPreview(id: string): Promise<void> {
     cycleDialog.showModal();
   } catch (error) { showError(error instanceof Error ? error.message : '미리보기를 불러오지 못했습니다.'); }
 }
-function filterSelect(labelText: string, items: Array<{ id: string; displayName?: string | null; name?: string }>, selected: string, change: (value: string) => void): HTMLElement {
+function filterSelect(labelText: string, items: Array<{ id: string; displayName?: string | null; name?: string; deleted?: boolean }>, selected: string, change: (value: string) => void): HTMLElement {
   const label = make('label'); text(label, labelText); const select = make('select'); const all = make('option'); all.value = ''; text(all, '전체'); select.append(all);
-  for (const item of items) { const option = make('option'); option.value = item.id; text(option, item.displayName ?? item.name ?? item.id); select.append(option); } select.value = selected; select.addEventListener('change', () => change(select.value)); label.append(select); return label;
+  for (const item of items) { const option = make('option'); option.value = item.id; text(option, `${item.displayName ?? item.name ?? item.id}${item.deleted ? ' · 삭제됨' : ''}`); select.append(option); } select.value = selected; select.addEventListener('change', () => change(select.value)); label.append(select); return label;
 }
 function pageButtons(list: HTMLElement, hasEarlier: boolean, earlier: () => void, latest: () => void): void { const bar = make('div', 'archive-batch'); const first = make('button', 'quiet'); text(first, '최근 기록'); first.addEventListener('click', latest); const more = make('button', 'quiet'); text(more, '이전 기록'); more.disabled = !hasEarlier; more.addEventListener('click', earlier); bar.append(first, more); list.append(bar); }
 async function copyText(value: string): Promise<void> { try { if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(value); else { const area = make('textarea'); area.value = value; document.body.append(area); area.select(); const copied = document.execCommand('copy'); area.remove(); if (!copied) window.prompt('복사할 내용', value); } } catch { window.prompt('복사할 내용', value); } }
 async function renderUsage(): Promise<void> {
   const sequence = ++usageRequestSequence;
   try { const query = new URLSearchParams({ limit: '100' }); if (usageParticipant) query.set('participantId', usageParticipant); if (usageConnection) query.set('connectionId', usageConnection); if (usageBefore) query.set('beforeId', String(usageBefore)); const result = await api<{ records: Array<any>; participants: any[]; connections: any[] }>(`/api/usage?${query}`); if (sequence !== usageRequestSequence || activeTab !== 'usage') return; const list = $('usage-list'); clear(list); const bar = make('div', 'archive-controls'); bar.append(filterSelect('참가자', result.participants, usageParticipant, (value) => { usageParticipant = value; usageBefore = undefined; void renderUsage(); }), filterSelect('Connection', result.connections, usageConnection, (value) => { usageConnection = value; usageBefore = undefined; void renderUsage(); })); list.append(bar);
-    for (const group of [['참가자 누계', result.participants], ['Connection 누계', result.connections]] as const) for (const item of group[1]) record(list, `${group[0]} · ${item.displayName ?? item.id}${item.type ? ` (${item.type})` : ''}${item.simulated ? ' · Mock 모의값 포함' : ''}`, `호출 ${item.calls} · 입력 ${item.inputTokens ?? '-'} / 출력 ${item.outputTokens ?? '-'} / reasoning ${item.reasoningTokens ?? '-'} / cache ${item.cachedInputTokens ?? '-'}`);
-    for (const usage of result.records) { const card = make('article', 'record-card'); const heading = make('h3'); text(heading, `${fmtTime(usage.createdAt)} · ${usage.participantName ?? usage.participantId} · ${usage.connectionName ?? '-'} (${usage.connectionType ?? '-'})${usage.simulated ? ' · Mock 모의값' : ''}`); const pre = make('pre'); text(pre, `request ${usage.requestId ?? '-'}\n입력 ${usage.inputTokens ?? '-'} / 출력 ${usage.outputTokens ?? '-'} / reasoning ${usage.reasoningTokens ?? '-'} / cache ${usage.cachedInputTokens ?? '-'}\n${usage.providerUsage ? JSON.stringify(usage.providerUsage, null, 2) : 'provider usage 미제공'}`); const cycle = make('button', 'quiet'); text(cycle, `Cycle ${usage.cycleId}`); cycle.addEventListener('click', () => void showCycle(usage.cycleId)); card.append(heading, pre, cycle); list.append(card); }
+    for (const group of [['참가자 누계', result.participants], ['Connection 누계', result.connections]] as const) for (const item of group[1]) record(list, `${group[0]} · ${item.displayName ?? item.id}${item.type ? ` (${item.type})` : ''}${item.deleted ? ' · 삭제됨' : ''}${item.simulated ? ' · Mock 모의값 포함' : ''}`, `호출 ${item.calls} · 입력 ${item.inputTokens ?? '-'} / 출력 ${item.outputTokens ?? '-'} / reasoning ${item.reasoningTokens ?? '-'} / cache ${item.cachedInputTokens ?? '-'}`);
+    for (const usage of result.records) { const card = make('article', 'record-card'); const heading = make('h3'); text(heading, `${fmtTime(usage.createdAt)} · ${usage.participantName ?? usage.participantId}${usage.participantDeleted ? ' · 참가자 삭제됨' : ''} · ${usage.connectionName ?? '-'} (${usage.connectionType ?? '-'})${usage.connectionDeleted ? ' · Connection 삭제됨' : ''}${usage.simulated ? ' · Mock 모의값' : ''}`); const pre = make('pre'); text(pre, `request ${usage.requestId ?? '-'}\n입력 ${usage.inputTokens ?? '-'} / 출력 ${usage.outputTokens ?? '-'} / reasoning ${usage.reasoningTokens ?? '-'} / cache ${usage.cachedInputTokens ?? '-'}\n${usage.providerUsage ? JSON.stringify(usage.providerUsage, null, 2) : 'provider usage 미제공'}`); const cycle = make('button', 'quiet'); text(cycle, `Cycle ${usage.cycleId}`); cycle.addEventListener('click', () => void showCycle(usage.cycleId)); card.append(heading, pre, cycle); list.append(card); }
     if (!result.records.length) record(list, 'Usage', '표시할 호출 기록이 없습니다.'); pageButtons(list, result.records.length === 100, () => { usageBefore = result.records.at(-1)?.id; void renderUsage(); }, () => { usageBefore = undefined; void renderUsage(); });
   } catch (error) { showError(error instanceof Error ? error.message : 'Usage를 불러오지 못했습니다.'); }
 }
-async function showCycle(id: string): Promise<void> { const epoch = roomEpoch; try { const data = await api<any>(`/api/cycles/${id}`); text($('cycle-dialog-title'), 'Cycle 상세'); const body = $('cycle-dialog-body'); clear(body); body.classList.remove('transport-preview'); record(body, `${data.cycle.status} · ${fmtTime(data.cycle.startedAt)}`, JSON.stringify({ result: data.result, events: data.events, usage: data.usage, error: data.cycle.error }, null, 2)); const errors = await api<any[]>(`/api/errors?cycleId=${encodeURIComponent(id)}`); if (epoch !== roomEpoch) return; for (const error of errors) { const button = make('button', 'quiet'); text(button, `Errors #${error.id} 보기`); button.addEventListener('click', () => { cycleDialog.close(); selectedError = error.id; errorBefore = undefined; setTab('errors'); }); body.append(button); } cycleDialog.showModal(); } catch (error) { showError(error instanceof Error ? error.message : 'Cycle 상세를 불러오지 못했습니다.'); } }
+async function showCycle(id: string): Promise<void> { const epoch = roomEpoch; try { const data = await api<any>(`/api/cycles/${id}`); text($('cycle-dialog-title'), 'Cycle 상세'); const body = $('cycle-dialog-body'); clear(body); body.classList.remove('transport-preview'); const connection = data.connection ? `${data.connection.displayName ?? data.connection.id}${data.connection.type ? ` (${data.connection.type})` : ''}${data.connection.deleted ? ' · 삭제됨' : ''}` : '-'; record(body, `${data.cycle.participantName ?? data.cycle.participantId}${data.cycle.participantDeleted ? ' · 참가자 삭제됨' : ''} · ${data.cycle.status} · ${fmtTime(data.cycle.startedAt)}`, JSON.stringify({ connection, result: data.result, events: data.events, usage: data.usage, error: data.cycle.error }, null, 2)); const errors = await api<any[]>(`/api/errors?cycleId=${encodeURIComponent(id)}`); if (epoch !== roomEpoch) return; for (const error of errors) { const button = make('button', 'quiet'); text(button, `Errors #${error.id} 보기`); button.addEventListener('click', () => { cycleDialog.close(); selectedError = error.id; errorBefore = undefined; setTab('errors'); }); body.append(button); } cycleDialog.showModal(); } catch (error) { showError(error instanceof Error ? error.message : 'Cycle 상세를 불러오지 못했습니다.'); } }
 async function renderCycles(): Promise<void> {
   const sequence = ++cycleRequestSequence;
-  try { const query = new URLSearchParams({ limit: '100' }); if (cycleParticipant) query.set('participantId', cycleParticipant); if (cycleBefore) query.set('beforeStartedAt', String(cycleBefore)); const cycles = await api<Array<any>>(`/api/cycles?${query}`); if (sequence !== cycleRequestSequence || activeTab !== 'cycles') return; const list = $('cycle-list'); clear(list); const names = new Map((state?.participants ?? []).map((item) => [item.id, item.displayName])); const items = [...new Set([...names.keys(), ...cycles.map((cycle) => cycle.participantId)])].map((id) => ({ id, displayName: names.get(id) ?? `${id} (삭제된 참가자)` })); list.append(filterSelect('참가자', items, cycleParticipant, (value) => { cycleParticipant = value; cycleBefore = undefined; void renderCycles(); }));
+  try { const query = new URLSearchParams({ limit: '100' }); if (cycleParticipant) query.set('participantId', cycleParticipant); if (cycleBefore) query.set('beforeStartedAt', String(cycleBefore)); const cycles = await api<Array<any>>(`/api/cycles?${query}`); if (sequence !== cycleRequestSequence || activeTab !== 'cycles') return; const list = $('cycle-list'); clear(list); const names = new Map((state?.participants ?? []).map((item) => [item.id, item.displayName])); const cycleByParticipant = new Map(cycles.map((cycle) => [cycle.participantId, cycle])); const items = [...new Set([...names.keys(), ...cycles.map((cycle) => cycle.participantId)])].map((id) => ({ id, displayName: names.get(id) ?? cycleByParticipant.get(id)?.participantName ?? cycleByParticipant.get(id)?.participantId ?? id, deleted: cycleByParticipant.get(id)?.participantDeleted === true })); list.append(filterSelect('참가자', items, cycleParticipant, (value) => { cycleParticipant = value; cycleBefore = undefined; void renderCycles(); }));
     for (const participant of state?.participants ?? []) { if (cycleParticipant && participant.id !== cycleParticipant) continue; const runtime = participant.runtime as any; const cycleState = participant.cycleState; record(list, `현재 · ${participant.displayName} · ${participant.enabled ? 'ON' : 'OFF'} · ${runtime.status === 'calling' ? 'generating' : runtime.nextPollAt ? 'polling' : runtime.status}`, `진행 시작 ${cycleState?.activeStartedAt ? fmtTime(cycleState.activeStartedAt) : '-'}\n마지막 완료 ${cycleState?.lastCompletedAt ? fmtTime(cycleState.lastCompletedAt) : '-'} · 마지막 Action ${cycleState?.lastAction?.toUpperCase() ?? '-'}\nObserved ${runtime.observed ? `T${cycleState?.observedThreadNumber ?? '?'}-R${runtime.observed.resNumber}` : '-'} · 다음 ${secondsUntil(runtime.nextPollAt)}`); }
-    for (const cycle of cycles) { const card = make('article', 'record-card'); const heading = make('h3'); const duration = cycle.completedAt != null ? `${((cycle.completedAt - cycle.startedAt) / 1000).toFixed(1)}초` : '진행 중'; text(heading, `${names.get(cycle.participantId) ?? cycle.participantId} · ${cycle.status} · ${cycle.finalAction?.toUpperCase() ?? '-'} · ${duration}`); const meta = make('p', 'fine'); text(meta, `시작 ${fmtTime(cycle.startedAt)} · 종료 ${cycle.completedAt != null ? fmtTime(cycle.completedAt) : '-'}${cycle.result?.res != null ? ` · T${cycle.result.thread}-R${cycle.result.res}` : ''}${cycle.result?.postId != null ? ` · P${cycle.result.postId}` : ''}`); const detail = make('button', 'quiet'); text(detail, '읽기 Action / Usage 상세'); detail.addEventListener('click', () => void showCycle(cycle.id)); card.append(heading, meta, detail); if (cycle.errorId) { const error = make('button', 'quiet'); text(error, `Errors #${cycle.errorId}`); error.addEventListener('click', () => { selectedError = cycle.errorId; errorBefore = undefined; setTab('errors'); }); card.append(error); } list.append(card); }
+    for (const cycle of cycles) { const card = make('article', 'record-card'); const heading = make('h3'); const duration = cycle.completedAt != null ? `${((cycle.completedAt - cycle.startedAt) / 1000).toFixed(1)}초` : '진행 중'; const connection = cycle.connection ? `${cycle.connection.displayName ?? cycle.connection.id}${cycle.connection.deleted ? ' · Connection 삭제됨' : ''}` : '-'; text(heading, `${names.get(cycle.participantId) ?? cycle.participantName ?? cycle.participantId}${cycle.participantDeleted ? ' · 참가자 삭제됨' : ''} · ${cycle.status} · ${cycle.finalAction?.toUpperCase() ?? '-'} · ${duration}`); const meta = make('p', 'fine'); text(meta, `Connection ${connection} · 시작 ${fmtTime(cycle.startedAt)} · 종료 ${cycle.completedAt != null ? fmtTime(cycle.completedAt) : '-'}${cycle.result?.res != null ? ` · T${cycle.result.thread}-R${cycle.result.res}` : ''}${cycle.result?.postId != null ? ` · P${cycle.result.postId}` : ''}`); const detail = make('button', 'quiet'); text(detail, '읽기 Action / Usage 상세'); detail.addEventListener('click', () => void showCycle(cycle.id)); card.append(heading, meta, detail); if (cycle.errorId) { const error = make('button', 'quiet'); text(error, `Errors #${cycle.errorId}`); error.addEventListener('click', () => { selectedError = cycle.errorId; errorBefore = undefined; setTab('errors'); }); card.append(error); } list.append(card); }
     if (!cycles.length) record(list, 'Cycle 이력', '기록이 없습니다.'); pageButtons(list, cycles.length === 100, () => { cycleBefore = cycles.at(-1)?.startedAt; void renderCycles(); }, () => { cycleBefore = undefined; void renderCycles(); });
   } catch (error) { showError(error instanceof Error ? error.message : 'Cycle 기록을 불러오지 못했습니다.'); }
 }

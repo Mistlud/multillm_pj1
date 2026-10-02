@@ -2,6 +2,7 @@
 [hidden] { display: none !important; }
 .connection-card>form{width:100%;flex:1}.connection-card>div>button+button,.connection-card form .wide>button+button,.participant-card>div>button+button{margin-left:8px}
 .memo-list{display:grid;gap:10px}.memo-card{border:1px solid var(--line);background:#fffefa;border-radius:12px;padding:14px}.memo-card h3{margin:0 0 5px}.memo-card p{margin:0 0 10px}.memo-body{white-space:pre-wrap;line-height:1.65;overflow-wrap:anywhere}
+.memo-toggle{display:flex;align-items:center;gap:8px;font-weight:700}.memo-toggle input{width:auto}
 .record-list{display:grid;gap:10px}.record-card{border:1px solid var(--line);background:#fffefa;border-radius:12px;padding:14px}.record-card h3{margin:0 0 8px;font-size:.92rem}.record-card pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:inherit;line-height:1.6}.manage-danger{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:20px 0}.manage-danger button{border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-weight:800;background:#e7f2eb;color:var(--green-dark)}.manage-danger .danger{background:#f4dfd9;color:#83362e}
 .archive-batch{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-4px 0 14px}.thread-select-list{display:flex;gap:8px;flex-wrap:wrap;width:100%}.thread-select-list label{display:flex;gap:5px;align-items:center;font-weight:600}.thread-select-list input{width:auto}.archive-message{text-align:left;font:inherit;color:inherit}.highlight{outline:3px solid #8bc9a9;background:#edf6f0}
 /* Every view keeps its content within the viewport without hiding overflow. */
@@ -18,3 +19,6 @@ pre,code,textarea{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-w
 .transport-field .fine{margin:0 0 8px}
 .transport-text{margin:0;font:inherit;line-height:1.65;white-space:pre-wrap}
 .prompt-editor{margin-bottom:24px;min-width:0;max-width:100%}.prompt-editor textarea{width:100%;font-family:ui-monospace,monospace;line-height:1.6;resize:vertical}.prompt-editor .fine{margin:0}.prompt-editor-actions{display:flex;gap:8px;flex-wrap:wrap;min-width:0;max-width:100%}
+.post-card{display:grid;grid-template-columns:minmax(0,1fr) max-content max-content}
+.post-card>button{white-space:nowrap}
+@media(max-width:680px){.post-card{grid-template-columns:minmax(0,1fr)}}

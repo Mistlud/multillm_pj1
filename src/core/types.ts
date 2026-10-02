@@ -126,6 +126,8 @@ export interface UsageRecord {
   participantName?: string | null;
   connectionName?: string | null;
   connectionType?: string | null;
+  participantDeleted: boolean;
+  connectionDeleted: boolean;
   simulated?: boolean;
   providerUsage: Record<string, unknown> | null;
   createdAt: number;
@@ -137,10 +139,11 @@ export interface UsageSummary {
   outputTokens: number;
   cachedInputTokens: number;
 }
-export interface UsageAggregate { id: Id; displayName: string | null; type?: string | null; calls: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; reasoningTokens: number | null; simulated: boolean; }
+export interface UsageAggregate { id: Id; displayName: string | null; type?: string | null; calls: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; reasoningTokens: number | null; simulated: boolean; deleted: boolean; }
 export interface UsageDetails { participants: UsageAggregate[]; connections: UsageAggregate[]; }
 export interface CycleEvent { id: number; cycleId: Id; kind: 'started' | 'read' | 'final' | 'completed' | 'failed'; payload: Record<string, unknown> | null; createdAt: number; }
-export interface CycleDetail { cycle: Cycle; events: CycleEvent[]; usage: UsageRecord[]; result: { resId: number | null; postId: number | null } | null; }
+export interface CycleConnection { id: Id; displayName: string | null; type: string | null; deleted: boolean; }
+export interface CycleDetail { cycle: Cycle; events: CycleEvent[]; usage: UsageRecord[]; result: { resId: number | null; postId: number | null } | null; connection: CycleConnection | null; }
 export interface ErrorRecord { id: number; roomId: Id; source: string; participantId: Id | null; connectionId: Id | null; cycleId: Id | null; httpStatus: number | null; providerCode: string | null; message: string; details: unknown; createdAt: number; }
 
 export interface CycleSnapshot {
@@ -162,6 +165,8 @@ export interface Cycle {
   startedAt: number;
   completedAt: number | null;
   error: string | null;
+  participantDeleted?: boolean;
+  participantName?: string | null;
 }
 
 export interface AddConnectionInput {
