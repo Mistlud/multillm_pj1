@@ -141,6 +141,24 @@ export interface UsageSummary {
 }
 export interface UsageAggregate { id: Id; displayName: string | null; type?: string | null; calls: number; inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; reasoningTokens: number | null; simulated: boolean; deleted: boolean; }
 export interface UsageDetails { participants: UsageAggregate[]; connections: UsageAggregate[]; }
+export type DashboardPeriod = "today" | "7d" | "30d";
+export type DashboardMode = "real" | "mock";
+export interface DashboardCycleCounts { calling: number; completed: number; failed: number; abandoned: number; input_blocked: number; }
+export interface DashboardTokenAggregate { calls: number; inputTokens: number | null; outputTokens: number | null; inputKnownCalls: number; outputKnownCalls: number; }
+export interface DashboardParticipant extends DashboardTokenAggregate { id: Id; displayName: string | null; deleted: boolean; cycles: DashboardCycleCounts; }
+export interface DashboardBucket extends DashboardTokenAggregate { start: number; end: number; label: string; }
+export interface DashboardChoice { id: Id; displayName: string | null; type?: string | null; deleted: boolean; }
+export interface DashboardData {
+  range: { from: number; to: number; timeZone: string; bucket: "hour" | "day" };
+  filters: { period: DashboardPeriod; mode: DashboardMode; participantId: Id | null; connectionId: Id | null };
+  totals: DashboardTokenAggregate & { cycles: DashboardCycleCounts; unclassifiedCycles: number };
+  buckets: DashboardBucket[];
+  participants: DashboardParticipant[];
+  choices: { participants: DashboardChoice[]; connections: DashboardChoice[] };
+}
+export interface NotificationCursor { generation: string; lastResId: number; }
+export interface NotificationItem { id: number; kind: 'res' | 'post'; authorName: string; }
+export interface RoomNotifications { cursor: NotificationCursor; items: NotificationItem[]; truncated: boolean; }
 export interface CycleEvent { id: number; cycleId: Id; kind: 'started' | 'read' | 'final' | 'completed' | 'failed'; payload: Record<string, unknown> | null; createdAt: number; }
 export interface CycleConnection { id: Id; displayName: string | null; type: string | null; deleted: boolean; }
 export interface CycleDetail { cycle: Cycle; events: CycleEvent[]; usage: UsageRecord[]; result: { resId: number | null; postId: number | null } | null; connection: CycleConnection | null; }

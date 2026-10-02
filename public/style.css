@@ -22,3 +22,21 @@ pre,code,textarea{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-w
 .post-card{display:grid;grid-template-columns:minmax(0,1fr) max-content max-content}
 .post-card>button{white-space:nowrap}
 @media(max-width:680px){.post-card{grid-template-columns:minmax(0,1fr)}}
+.dashboard-controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px}
+.dashboard-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.dashboard-stat,.dashboard-chart{min-width:0;border:1px solid var(--line);border-radius:12px;padding:14px;background:#fffefa}
+.dashboard-stat strong{display:block;margin:6px 0;font-size:1.35rem;overflow-wrap:anywhere}
+.dashboard-stat p,.dashboard-stat .fine{margin:0}
+.dashboard-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.dashboard-chart h3{margin:0 0 8px}.dashboard-chart>p{margin:8px 0}.dashboard-chart svg{display:block;width:100%;height:auto;overflow:visible}
+.chart-axis{stroke:var(--line);stroke-width:1}.chart-axis-label{fill:var(--ink-soft);font-size:11px}.chart-input{stroke:var(--green);fill:var(--green)}.chart-output{stroke:#956434;fill:#956434}.chart-completed{fill:var(--green)}.chart-failed{fill:var(--red)}.chart-abandoned{fill:#956434}.chart-input-blocked{fill:#66758a}.chart-point{cursor:pointer;stroke-width:2}.chart-point:focus-visible{outline:none;stroke:var(--ink);stroke-width:4}.chart-line{fill:none;stroke-width:2}
+.chart-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:8px 0;font-size:.8rem}.chart-legend span{display:inline-flex;align-items:center;gap:5px}.chart-swatch{width:10px;height:10px;border-radius:2px;background:var(--green)}.chart-swatch.output{background:#956434}.chart-swatch.failed{background:var(--red)}.chart-swatch.abandoned{background:#956434}.chart-swatch.input-blocked{background:#66758a}
+.chart-detail{min-height:2.6em;font-size:.82rem;color:var(--ink-soft);line-height:1.5}.chart-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:10px;table-layout:fixed}.chart-table th,.chart-table td{text-align:left;padding:7px 4px;border-bottom:1px solid var(--line);overflow-wrap:anywhere;vertical-align:top}.chart-table button{padding:2px 0;border:0;background:transparent;color:var(--green-dark);text-decoration:underline}.dashboard-chart details summary{cursor:pointer;font-size:.85rem}.dashboard-chart .quiet{margin-top:10px}
+@media(max-width:820px){.dashboard-controls,.dashboard-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-charts{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:440px){.dashboard-controls{grid-template-columns:minmax(0,1fr)}}
+.room-heading{display:flex;align-items:center;gap:10px;min-width:0}.room-heading h1{min-width:0}.notification-bell{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:32px;height:32px;margin-bottom:8px;padding:5px;border:1px solid var(--line);border-radius:50%;background:var(--card);color:var(--ink-soft)}.notification-bell.has-unread{color:var(--red);border-color:#d9a49b}.notification-light{position:absolute;right:1px;top:1px;width:8px;height:8px;border-radius:50%;background:#d23232;box-shadow:0 0 6px rgba(210,50,50,.45)}
+.notification-toast{position:fixed;right:max(18px,env(safe-area-inset-right));bottom:max(18px,env(safe-area-inset-bottom));z-index:8;width:min(340px,calc(100vw - 32px));border:1px solid #bfd9ca;border-radius:12px;background:var(--card);box-shadow:0 8px 30px rgba(23,48,68,.18);animation:notification-rise .18s ease-out}.notification-toast button{display:grid;gap:6px;width:100%;padding:14px 16px;border:0;border-radius:12px;background:transparent;text-align:left}.notification-toast strong{font-size:.9rem;overflow-wrap:anywhere}.notification-toast span{font-size:.76rem;color:var(--ink-soft)}
+@keyframes notification-rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){.notification-toast{animation:none}}
+.notification-bell.click-feedback svg{animation:bell-click-feedback .25s ease-out}
+@keyframes bell-click-feedback{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}

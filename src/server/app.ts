@@ -135,9 +135,26 @@ export function createApp(config: AppConfig, options: { store?: RoomStore; onShu
       }
       if (url.pathname === '/api/state' && method === 'GET') {
         const current = store.getCurrentThread(room.id)!;
-        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id).map((participant) => ({ ...participant, cycleState: store.getParticipantCycleState(participant) })), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), limits: store.limits, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
+        const hasNotificationGeneration = url.searchParams.has('notificationGeneration'), hasNotificationAfter = url.searchParams.has('notificationAfter');
+        if (hasNotificationGeneration !== hasNotificationAfter) throw new HttpError(400, '알림 커서는 generation과 after를 함께 보내야 합니다.');
+        let notificationCursor: { generation: string; after: number } | undefined;
+        if (hasNotificationGeneration && hasNotificationAfter) {
+          const generation = url.searchParams.get('notificationGeneration'), after = url.searchParams.get('notificationAfter');
+          if (!generation || generation.length > 128 || !/^[A-Za-z0-9_-]+$/.test(generation) || !after || !/^\d+$/.test(after)) throw new HttpError(400, '알림 커서 값을 확인하세요.');
+          const afterNumber = Number(after); if (!Number.isSafeInteger(afterNumber) || afterNumber < 0) throw new HttpError(400, '알림 커서 값을 확인하세요.');
+          notificationCursor = { generation, after: afterNumber };
+        }
+        json(res, 200, { room: store.getRoom(room.id), thread: current, messages: store.listThreadRes(current.id), participants: store.listParticipants(room.id).map((participant) => ({ ...participant, cycleState: store.getParticipantCycleState(participant) })), participantMemos: store.listParticipantMemos(room.id), connections: store.listConnections().map(safeConnection), posts: store.listPosts(room.id).map(({ body: _body, ...post }) => post), threads: store.listThreads(room.id), usage: store.getUsageSummary({ roomId: room.id }), notifications: store.getNotifications(room.id, notificationCursor), limits: store.limits, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, lanAddresses: addresses.map((ip) => `http://${ip}:${config.port}`) }); return;
       }
       if (url.pathname === '/api/participant-memos' && method === 'GET') { json(res, 200, store.listParticipantMemos(room.id, url.searchParams.get('includeDeleted') === '1')); return; }
+      if (url.pathname === '/api/dashboard' && method === 'GET') {
+        if (url.searchParams.has('from') || url.searchParams.has('to')) throw new HttpError(400, '대시보드 기간은 period=today|7d|30d으로만 지정하세요.');
+        const period = url.searchParams.get('period') ?? '7d'; const mode = url.searchParams.get('mode') ?? 'real';
+        if (period !== 'today' && period !== '7d' && period !== '30d') throw new HttpError(400, 'period는 today, 7d, 30d 중 하나여야 합니다.');
+        if (mode !== 'real' && mode !== 'mock') throw new HttpError(400, 'mode는 real 또는 mock이어야 합니다.');
+        const participantId = url.searchParams.get('participantId') || undefined, connectionId = url.searchParams.get('connectionId') || undefined;
+        json(res, 200, store.getDashboard(room.id, { period, mode, participantId, connectionId })); return;
+      }
       if (url.pathname === '/api/prompts' && method === 'GET') { json(res, 200, corePrompts(store.getCorePrompt(room.id))); return; }
       if (url.pathname === '/api/prompts' && method === 'PATCH') {
         const input = await body(req, 1_300_000);

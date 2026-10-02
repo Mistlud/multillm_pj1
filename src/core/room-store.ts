@@ -4,7 +4,7 @@ import { assertTokenLimit, countTokens, type TokenCounter } from "./tokens.js";
 import type {
   AddConnectionInput, AddParticipantInput, AppendResInput, Connection, CoreLimits, Cursor, Cycle, CycleSnapshot,
   FinalAction, ModelInput, Participant, ParticipantDetail, ParticipantMemo, ParticipantRuntime, Post, PublicRes, Room, Thread,
-  RuntimeStatus, UpdateConnectionInput, UpdateParticipantInput, UsageRecord, UsageSummary, UsageDetails, UsageAggregate, CycleDetail, CycleConnection, CycleEvent, ErrorRecord,
+  RuntimeStatus, UpdateConnectionInput, UpdateParticipantInput, UsageRecord, UsageSummary, UsageDetails, UsageAggregate, CycleDetail, CycleConnection, CycleEvent, ErrorRecord, DashboardData, DashboardMode, DashboardPeriod, DashboardChoice, DashboardCycleCounts, RoomNotifications,
 } from "./types.js";
 import { sanitizeError } from "./redaction.js";
 import { CorePromptConflictError, DEFAULT_CORE_PROMPT, validateCorePrompt } from './prompt-template.js';
@@ -134,6 +134,22 @@ export class RoomStore {
 
   listThreads(roomId: string): Thread[] {
     return (this.db.prepare("SELECT * FROM threads WHERE room_id = ? ORDER BY number DESC").all(roomId) as SqlRow[]).map((row) => this.mapThread(row));
+  }
+
+  /** Returns participant-authored public records after an acknowledged Res id, without retaining per-client state. */
+  getNotifications(roomId: string, input?: { generation: string; after: number }): RoomNotifications {
+    const generationRow = this.db.prepare('SELECT id FROM threads WHERE room_id = ? AND number = 1').get(roomId) as SqlRow | undefined;
+    if (!generationRow) throw new Error('room has no notification generation');
+    const generation = String(generationRow.id);
+    // This intentionally includes admin records and records now hidden by thread/post deletion, so a cursor always advances.
+    // Seek the latest nonempty thread and its last Res through existing ordered indexes.
+    const highRow = this.db.prepare('SELECT COALESCE((SELECT r.id FROM res r WHERE r.thread_id = (SELECT t.id FROM threads t WHERE t.room_id = ? AND t.res_count > 0 ORDER BY t.number DESC LIMIT 1) ORDER BY r.number DESC LIMIT 1), 0) AS id').get(roomId) as SqlRow;
+    const lastResId = number(highRow.id);
+    const baseline = !input || input.generation !== generation || input.after > lastResId;
+    if (baseline) return { cursor: { generation, lastResId }, items: [], truncated: false };
+    if (input.after === lastResId) return { cursor: { generation, lastResId }, items: [], truncated: false };
+    const rows = this.db.prepare("SELECT r.id, CASE WHEN r.post_id IS NULL THEN 'res' ELSE 'post' END AS kind, r.author_display_name FROM res r JOIN threads t ON t.id = r.thread_id LEFT JOIN posts p ON p.id = r.post_id AND p.room_id = t.room_id WHERE t.room_id = ? AND r.id > ? AND r.id <= ? AND r.author_type = 'participant' AND t.deleted_at IS NULL AND (r.post_id IS NULL OR p.id IS NOT NULL AND p.deleted_at IS NULL) ORDER BY r.id DESC LIMIT 51").all(roomId, input.after, lastResId) as SqlRow[];
+    return { cursor: { generation, lastResId }, items: rows.slice(0, 50).reverse().map((row) => ({ id: number(row.id), kind: String(row.kind) as 'res' | 'post', authorName: String(row.author_display_name) })), truncated: rows.length > 50 };
   }
 
   /** Builds exactly the app-level input used by a cycle, without reserving a cycle or changing cursors. */
@@ -471,6 +487,97 @@ export class RoomStore {
     };
     return { participants: aggregate('participant'), connections: aggregate('connection') };
   }
+  /** Compact dashboard aggregates. Usage is bounded by request time; cycle status is bounded by cycle start time. */
+  getDashboard(roomId: string, input: { period: DashboardPeriod; mode: DashboardMode; participantId?: string; connectionId?: string }): DashboardData {
+    if (!['today', '7d', '30d'].includes(input.period)) throw new Error('invalid dashboard period');
+    if (!['real', 'mock'].includes(input.mode)) throw new Error('invalid dashboard mode');
+    const now = this.now(); const start = new Date(now); start.setHours(0, 0, 0, 0);
+    const days = input.period === 'today' ? 1 : input.period === '7d' ? 7 : 30;
+    start.setDate(start.getDate() - (days - 1));
+    const from = start.getTime(), to = now, bucket = input.period === 'today' ? 'hour' as const : 'day' as const;
+    const modeValue = input.mode === 'mock' ? 1 : 0;
+    const usageClauses = ['cy.room_id = ?', 'u.created_at >= ?', 'u.created_at <= ?', 'u.simulated = ?'];
+    const usageValues: SQLInputValue[] = [roomId, from, to, modeValue];
+    if (input.participantId) { usageClauses.push('u.participant_id = ?'); usageValues.push(input.participantId); }
+    if (input.connectionId) { usageClauses.push('u.connection_id = ?'); usageValues.push(input.connectionId); }
+    const usageWhere = usageClauses.join(' AND ');
+    const choiceUsageWhere = ['cy.room_id = ?', 'u.created_at >= ?', 'u.created_at <= ?', 'u.simulated = ?'].join(' AND ');
+    const choiceUsageValues: SQLInputValue[] = [roomId, from, to, modeValue];
+    const tokenColumns = "COUNT(*) AS calls, COALESCE(SUM(u.input_tokens), 0) AS input_tokens, COALESCE(SUM(u.output_tokens), 0) AS output_tokens, SUM(CASE WHEN u.input_tokens IS NOT NULL THEN 1 ELSE 0 END) AS input_known_calls, SUM(CASE WHEN u.output_tokens IS NOT NULL THEN 1 ELSE 0 END) AS output_known_calls";
+    const usageTotal = this.db.prepare(`SELECT ${tokenColumns} FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${usageWhere}`).get(...usageValues) as SqlRow;
+    const usageBuckets = bucket === 'hour'
+      ? this.db.prepare(`SELECT CAST((u.created_at - ?) / 3600000 AS INTEGER) AS bucket_key, ${tokenColumns} FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${usageWhere} GROUP BY bucket_key ORDER BY bucket_key`).all(from, ...usageValues) as SqlRow[]
+      : this.db.prepare(`SELECT strftime('%Y-%m-%d', u.created_at / 1000, 'unixepoch', 'localtime') AS bucket_label, ${tokenColumns} FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${usageWhere} GROUP BY bucket_label ORDER BY bucket_label`).all(...usageValues) as SqlRow[];
+    const usageParticipants = this.db.prepare(`SELECT stats.*, COALESCE(latest.participant_name, p.display_name) AS display_name, CASE WHEN p.deleted_at IS NOT NULL THEN 1 ELSE 0 END AS deleted FROM (SELECT u.participant_id AS id, MAX(u.id) AS latest_id, ${tokenColumns} FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${usageWhere} GROUP BY u.participant_id) stats JOIN usage latest ON latest.id = stats.latest_id LEFT JOIN participants p ON p.id = stats.id`).all(...usageValues) as SqlRow[];
+
+    const baseCycleClauses = ['cy.room_id = ?', 'cy.started_at >= ?', 'cy.started_at <= ?'];
+    const cycleClauses = [...baseCycleClauses]; const cycleValues: SQLInputValue[] = [roomId, from, to];
+    if (input.participantId) { cycleClauses.push('cy.participant_id = ?'); cycleValues.push(input.participantId); }
+    const cycleClassification = (clauses: string[]) => `WITH cycle_classified AS (
+      SELECT cy.participant_id, cy.status, p.display_name, p.deleted_at,
+        COALESCE(first_usage.connection_id, CASE WHEN json_valid(cy.input_signature) THEN json_extract(cy.input_signature, '$.connection.id') END) AS connection_id,
+        CASE WHEN first_usage.id IS NOT NULL THEN first_usage.simulated
+          WHEN CASE WHEN json_valid(cy.input_signature) THEN json_extract(cy.input_signature, '$.connection.type') END IS NOT NULL
+          THEN CASE WHEN json_extract(cy.input_signature, '$.connection.type') = 'mock' THEN 1 ELSE 0 END
+          ELSE NULL END AS simulated
+      FROM cycles cy
+      LEFT JOIN usage first_usage ON first_usage.id = (SELECT u.id FROM usage u WHERE u.cycle_id = cy.id ORDER BY u.id LIMIT 1)
+      LEFT JOIN participants p ON p.id = cy.participant_id
+      WHERE ${clauses.join(' AND ')}
+    )`;
+    const cycleMode = input.connectionId ? 'connection_id = ? AND simulated = ?' : '(simulated = ?)';
+    const cycleModeValues: SQLInputValue[] = input.connectionId ? [...cycleValues, input.connectionId, modeValue] : [...cycleValues, modeValue];
+    const cycleColumns = "SUM(CASE WHEN status = 'calling' THEN 1 ELSE 0 END) AS calling, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) AS abandoned, SUM(CASE WHEN status = 'input_blocked' THEN 1 ELSE 0 END) AS input_blocked";
+    const cycleTotal = this.db.prepare(`${cycleClassification(cycleClauses)} SELECT ${cycleColumns} FROM cycle_classified WHERE ${cycleMode}`).get(...cycleModeValues) as SqlRow;
+    const cycleParticipants = this.db.prepare(`${cycleClassification(cycleClauses)} SELECT participant_id AS id, MAX(display_name) AS display_name, MAX(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS deleted, ${cycleColumns} FROM cycle_classified WHERE ${cycleMode} GROUP BY participant_id`).all(...cycleModeValues) as SqlRow[];
+    const unclassifiedCycles = input.connectionId ? 0 : number((this.db.prepare(`${cycleClassification(cycleClauses)} SELECT COUNT(*) AS count FROM cycle_classified WHERE simulated IS NULL`).get(...cycleValues) as SqlRow).count);
+
+    const tokenAggregate = (row: SqlRow) => {
+      const calls = number(row.calls), inputKnownCalls = number(row.input_known_calls), outputKnownCalls = number(row.output_known_calls);
+      return { calls, inputTokens: calls > 0 && inputKnownCalls === 0 ? null : number(row.input_tokens), outputTokens: calls > 0 && outputKnownCalls === 0 ? null : number(row.output_tokens), inputKnownCalls, outputKnownCalls };
+    };
+    const cycleAggregate = (row: SqlRow): DashboardCycleCounts => ({ calling: number(row.calling ?? 0), completed: number(row.completed ?? 0), failed: number(row.failed ?? 0), abandoned: number(row.abandoned ?? 0), input_blocked: number(row.input_blocked ?? 0) });
+    const localLabel = (value: Date, hour = false): string => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}${hour ? ` ${String(value.getHours()).padStart(2, '0')}:00` : ''}`;
+    const bucketMap = new Map<string | number, SqlRow>();
+    for (const row of usageBuckets) bucketMap.set(bucket === 'hour' ? number(row.bucket_key) : String(row.bucket_label), row);
+    const buckets: DashboardData['buckets'] = [];
+    if (bucket === 'hour') {
+      for (let key = 0; from + key * 3_600_000 <= to; key += 1) {
+        const bucketStart = from + key * 3_600_000, value = new Date(bucketStart), row = bucketMap.get(key);
+        buckets.push({ start: bucketStart, end: Math.min(bucketStart + 3_600_000, to), label: localLabel(value, true), ...(row ? tokenAggregate(row) : { calls: 0, inputTokens: 0, outputTokens: 0, inputKnownCalls: 0, outputKnownCalls: 0 }) });
+      }
+    } else {
+      const value = new Date(from);
+      while (value.getTime() <= to) {
+        const label = localLabel(value), row = bucketMap.get(label), bucketStart = value.getTime(), next = new Date(bucketStart); next.setDate(next.getDate() + 1);
+        buckets.push({ start: bucketStart, end: Math.min(next.getTime(), to), label, ...(row ? tokenAggregate(row) : { calls: 0, inputTokens: 0, outputTokens: 0, inputKnownCalls: 0, outputKnownCalls: 0 }) });
+        value.setDate(value.getDate() + 1);
+      }
+    }
+    const participantMap = new Map<string, DashboardData['participants'][number]>();
+    for (const row of usageParticipants) participantMap.set(String(row.id), { id: String(row.id), displayName: nullableString(row.display_name), deleted: Boolean(row.deleted), ...tokenAggregate(row), cycles: cycleAggregate({}) });
+    for (const row of cycleParticipants) {
+      const id = String(row.id); const existing = participantMap.get(id);
+      if (existing) { existing.cycles = cycleAggregate(row); existing.deleted ||= Boolean(row.deleted); if (!existing.displayName) existing.displayName = nullableString(row.display_name); }
+      else participantMap.set(id, { id, displayName: nullableString(row.display_name), deleted: Boolean(row.deleted), calls: 0, inputTokens: 0, outputTokens: 0, inputKnownCalls: 0, outputKnownCalls: 0, cycles: cycleAggregate(row) });
+    }
+    const choiceParticipants = new Map<string, DashboardChoice>();
+    for (const row of this.db.prepare(`SELECT stats.id, COALESCE(latest.participant_name, p.display_name) AS display_name, CASE WHEN p.deleted_at IS NOT NULL THEN 1 ELSE 0 END AS deleted FROM (SELECT u.participant_id AS id, MAX(u.id) AS latest_id FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${choiceUsageWhere} GROUP BY u.participant_id) stats JOIN usage latest ON latest.id = stats.latest_id LEFT JOIN participants p ON p.id = stats.id`).all(...choiceUsageValues) as SqlRow[]) choiceParticipants.set(String(row.id), { id: String(row.id), displayName: nullableString(row.display_name), deleted: Boolean(row.deleted) });
+    for (const row of this.db.prepare(`${cycleClassification(baseCycleClauses)} SELECT participant_id AS id, MAX(display_name) AS display_name, MAX(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS deleted FROM cycle_classified WHERE simulated = ? GROUP BY participant_id`).all(roomId, from, to, modeValue) as SqlRow[]) if (!choiceParticipants.has(String(row.id))) choiceParticipants.set(String(row.id), { id: String(row.id), displayName: nullableString(row.display_name), deleted: Boolean(row.deleted) });
+    const choiceConnections = new Map<string, DashboardChoice>();
+    for (const row of this.db.prepare(`SELECT stats.id, COALESCE(latest.connection_name, c.name) AS display_name, COALESCE(latest.connection_type, c.type) AS type, CASE WHEN c.id IS NULL THEN 1 ELSE 0 END AS deleted FROM (SELECT u.connection_id AS id, MAX(u.id) AS latest_id FROM usage u JOIN cycles cy ON cy.id = u.cycle_id WHERE ${choiceUsageWhere} AND u.connection_id IS NOT NULL GROUP BY u.connection_id) stats JOIN usage latest ON latest.id = stats.latest_id LEFT JOIN connections c ON c.id = stats.id`).all(...choiceUsageValues) as SqlRow[]) choiceConnections.set(String(row.id), { id: String(row.id), displayName: nullableString(row.display_name), type: nullableString(row.type), deleted: Boolean(row.deleted) });
+    for (const row of this.db.prepare(`${cycleClassification(baseCycleClauses)} SELECT connection_id AS id, MAX(c.type) AS type, MAX(c.name) AS display_name, MAX(CASE WHEN c.id IS NULL THEN 1 ELSE 0 END) AS deleted FROM cycle_classified LEFT JOIN connections c ON c.id = cycle_classified.connection_id WHERE simulated = ? AND connection_id IS NOT NULL GROUP BY connection_id`).all(roomId, from, to, modeValue) as SqlRow[]) if (!choiceConnections.has(String(row.id))) choiceConnections.set(String(row.id), { id: String(row.id), displayName: nullableString(row.display_name), type: nullableString(row.type), deleted: Boolean(row.deleted) });
+    const connections = [...choiceConnections.values()].sort((a, b) => (a.displayName ?? a.id).localeCompare(b.displayName ?? b.id));
+    const participants = [...participantMap.values()].sort((a, b) => (a.displayName ?? a.id).localeCompare(b.displayName ?? b.id));
+    return {
+      range: { from, to, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, bucket },
+      filters: { period: input.period, mode: input.mode, participantId: input.participantId ?? null, connectionId: input.connectionId ?? null },
+      totals: { ...tokenAggregate(usageTotal), cycles: cycleAggregate(cycleTotal), unclassifiedCycles },
+      buckets,
+      participants,
+      choices: { participants: [...choiceParticipants.values()].sort((a, b) => (a.displayName ?? a.id).localeCompare(b.displayName ?? b.id)), connections },
+    };
+  }
   listCycles(roomId: string, filters: { participantId?: string; limit?: number; beforeStartedAt?: number } = {}): Cycle[] {
     const clauses = ['room_id = ?']; const values: SQLInputValue[] = [roomId]; if (filters.participantId) { clauses.push('participant_id = ?'); values.push(filters.participantId); } if (filters.beforeStartedAt) { clauses.push('started_at < ?'); values.push(filters.beforeStartedAt); } values.push(Math.min(Math.max(filters.limit ?? 100, 1), 500));
     return (this.db.prepare(`SELECT cy.*, p.deleted_at AS participant_deleted_at, COALESCE((SELECT u.participant_name FROM usage u WHERE u.cycle_id = cy.id AND u.participant_name IS NOT NULL ORDER BY u.id LIMIT 1), p.display_name) AS participant_name FROM cycles cy LEFT JOIN participants p ON p.id = cy.participant_id WHERE ${clauses.map((clause) => clause.replace(/^room_id/, 'cy.room_id').replace(/^participant_id/, 'cy.participant_id').replace(/^started_at/, 'cy.started_at')).join(' AND ')} ORDER BY cy.started_at DESC LIMIT ?`).all(...values) as SqlRow[]).map((row) => this.mapCycle(row));
@@ -584,7 +691,7 @@ export class RoomStore {
       CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, participant_id TEXT NOT NULL REFERENCES participants(id), participant_name TEXT, connection_id TEXT, connection_name TEXT, connection_type TEXT, simulated INTEGER NOT NULL DEFAULT 0, cycle_id TEXT NOT NULL REFERENCES cycles(id), request_id TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_input_tokens INTEGER, reasoning_tokens INTEGER, provider_usage_json TEXT, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS cycle_events (id INTEGER PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES cycles(id), kind TEXT NOT NULL, payload_json TEXT, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id), source TEXT NOT NULL, participant_id TEXT, connection_id TEXT, cycle_id TEXT, http_status INTEGER, provider_code TEXT, message TEXT NOT NULL, details_json TEXT, created_at INTEGER NOT NULL);
-      CREATE INDEX IF NOT EXISTS idx_res_thread_number ON res(thread_id, number); CREATE INDEX IF NOT EXISTS idx_threads_room_number ON threads(room_id, number); CREATE INDEX IF NOT EXISTS idx_cycles_participant_status ON cycles(participant_id, status); CREATE INDEX IF NOT EXISTS idx_usage_participant ON usage(participant_id);
+      CREATE INDEX IF NOT EXISTS idx_res_thread_number ON res(thread_id, number); CREATE INDEX IF NOT EXISTS idx_threads_room_number ON threads(room_id, number); CREATE INDEX IF NOT EXISTS idx_cycles_participant_status ON cycles(participant_id, status); CREATE INDEX IF NOT EXISTS idx_usage_participant ON usage(participant_id); CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at); CREATE INDEX IF NOT EXISTS idx_usage_cycle ON usage(cycle_id, id); CREATE INDEX IF NOT EXISTS idx_cycles_room_started_at ON cycles(room_id, started_at);
       CREATE TABLE IF NOT EXISTS res_search (res_id INTEGER NOT NULL REFERENCES res(id), term TEXT NOT NULL, PRIMARY KEY (res_id, term)); CREATE INDEX IF NOT EXISTS idx_res_search_term ON res_search(term);
       CREATE TRIGGER IF NOT EXISTS res_is_immutable_update BEFORE UPDATE ON res BEGIN SELECT RAISE(ABORT, 'res is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS res_is_immutable_delete BEFORE DELETE ON res BEGIN SELECT RAISE(ABORT, 'res is immutable'); END;

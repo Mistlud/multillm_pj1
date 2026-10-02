@@ -1,3 +1,5 @@
+import type { DashboardData, DashboardTokenAggregate as DashboardUsage, RoomNotifications as NotificationFeed } from '../core/types.js';
+
 type Author = { displayName: string };
 type Message = { id: number; threadId: string; threadNumber: number; number: number; author: Author; body: string; postId: number | null; createdAt: number };
 type Thread = { id: string; number: number; status: "open" | "closed"; resCount: number; deletedAt?: number | null };
@@ -9,7 +11,7 @@ type Participant = { id: string; displayName: string; enabled: boolean; connecti
 type ParticipantMemo = { participantId: string; displayName: string; privateMemo: string; updatedAt: number; deletedAt: number | null };
 type CorePromptRecord = { name: string; adapter: string; text: string };
 class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
-type State = { room: { name: string }; thread: Thread; messages: Message[]; participants: Participant[]; participantMemos: ParticipantMemo[]; connections: Connection[]; posts: PostMeta[]; threads: Thread[]; usage: { calls: number; inputTokens: number; outputTokens: number }; limits: { messageTokens: number }; lanAddresses: string[]; timeZone?: string };
+type State = { room: { name: string }; thread: Thread; messages: Message[]; participants: Participant[]; participantMemos: ParticipantMemo[]; connections: Connection[]; posts: PostMeta[]; threads: Thread[]; usage: { calls: number; inputTokens: number; outputTokens: number }; limits: { messageTokens: number }; lanAddresses: string[]; timeZone?: string; notifications?: NotificationFeed };
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const loginView = $("login-view"), appView = $("app-view"), shutdownView = $("shutdown-view");
@@ -27,6 +29,11 @@ const reportedMessages = new Set<string>();
 let state: State | null = null;
 let activeTab = "room";
 let refreshTimer: number | undefined;
+let stateContextVersion = 0, stateRequestSequence = 0, stateAppliedSequence = 0;
+let notificationCursor: NotificationFeed['cursor'] | undefined, notificationTimer: number | undefined;
+let notificationBatchCount = 0, notificationBatchTruncated = false, notificationToastExpiresAt = 0;
+let dashboardPeriod = '7d', dashboardMode = 'real', dashboardParticipant = '', dashboardConnection = '';
+let dashboardTimer: number | undefined, dashboardRequest: AbortController | undefined, dashboardEpoch = 0, dashboardPending = false, dashboardFingerprint = '';
 let roomFingerprint = "", boardFingerprint = "", memoFingerprint = "", manageFingerprint = "";
 let promptsLoading = false;
 let savedCorePrompt: string | undefined, latestCorePrompt: string | undefined, promptSaving = false;
@@ -55,15 +62,26 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
-async function loadState(): Promise<void> {
-  const next = await api<State>("/api/state");
-  if (state && state.thread.id !== next.thread.id && next.thread.number === 1) { roomEpoch++; resetDeletedMemos(); archiveRequestSequence++; usageRequestSequence++; cycleRequestSequence++; archiveQuery = ''; archiveDetail = null; archiveSearchActive = false; archiveFingerprint = ''; usageBefore = cycleBefore = errorBefore = undefined; if (postDialog.open) postDialog.close(); if (cycleDialog.open) cycleDialog.close(); clear($('archive-result')); }
+async function loadState(): Promise<boolean> {
+  const context = stateContextVersion, sequence = ++stateRequestSequence;
+  const query = notificationCursor ? `?${new URLSearchParams({ notificationGeneration: notificationCursor.generation, notificationAfter: String(notificationCursor.lastResId) })}` : '';
+  let next: State;
+  try { next = await api<State>(`/api/state${query}`); }
+  catch (error) { if (context !== stateContextVersion || sequence < stateAppliedSequence) return false; throw error; }
+  if (context !== stateContextVersion || sequence < stateAppliedSequence) return false;
+  stateAppliedSequence = sequence;
+  const reset = (state && state.thread.id !== next.thread.id && next.thread.number === 1) || (notificationCursor && next.notifications && notificationCursor.generation !== next.notifications.cursor.generation);
+  if (reset) { roomEpoch++; resetNotifications(); resetDashboard(); resetDeletedMemos(); archiveRequestSequence++; usageRequestSequence++; cycleRequestSequence++; archiveQuery = ''; archiveDetail = null; archiveSearchActive = false; archiveFingerprint = ''; usageBefore = cycleBefore = errorBefore = undefined; if (postDialog.open) postDialog.close(); if (cycleDialog.open) cycleDialog.close(); clear($('archive-result')); }
   if (postDialog.open) { const post = next.posts.find((item) => String(item.id) === postDialog.dataset.postId); if (post?.deletedAt != null) { text($('dialog-post-title'), post.title); text($('dialog-post-body'), '관리자에 의해 삭제된 게시글입니다.'); } }
   if (postDialog.open && postDialog.dataset.postId) void refreshOpenPost(postDialog.dataset.postId);
   state = next; roomName.textContent = next.room.name; $("res-limit").textContent = `공통 한도 ${next.limits.messageTokens} tokens`;
   $("usage-summary").textContent = `호출 ${next.usage.calls} · 입력 ${next.usage.inputTokens.toLocaleString()} · 출력 ${next.usage.outputTokens.toLocaleString()}`;
   $("connection-state").textContent = "로컬 연결됨";
   renderActive();
+  consumeNotifications(next.notifications);
+  if (reset) syncDashboard(true);
+  else if (activeTab === 'dashboard' && !dashboardRequest && dashboardTimer === undefined) syncDashboard();
+  return true;
 }
 
 function renderActive(): void {
@@ -93,6 +111,61 @@ function renderRoom(): void {
 function scrollRoomToLatest(): void {
   if (activeTab === 'room' && !appView.hidden) messages.scrollTop = messages.scrollHeight;
 }
+
+function updateNotificationBell(unread: boolean): void {
+  $('notification-bell').classList.toggle('has-unread', unread); $('notification-light').hidden = !unread;
+  $('notification-bell').setAttribute('aria-label', unread ? '미확인 새 글 알림 · 클릭하면 표시 해제' : '새 글 알림 없음');
+  $('notification-bell').title = unread ? '미확인 새 글 알림 · 클릭하면 표시 해제' : '새 글 알림 없음';
+}
+function dismissNotificationToast(): void {
+  if (notificationTimer !== undefined) window.clearTimeout(notificationTimer);
+  notificationTimer = undefined; notificationToastExpiresAt = 0; $('notification-toast').hidden = true;
+  notificationBatchCount = 0; notificationBatchTruncated = false;
+}
+function acknowledgeNotifications(): void { updateNotificationBell(false); dismissNotificationToast(); }
+function clickNotificationBell(): void {
+  acknowledgeNotifications();
+  const bell = $('notification-bell'); bell.classList.remove('click-feedback');
+  void bell.offsetWidth; // Restart the small feedback motion even on rapid repeated clicks.
+  bell.classList.add('click-feedback');
+}
+function resetNotifications(): void {
+  stateContextVersion++; notificationCursor = undefined; acknowledgeNotifications(); text($('notification-toast-title'), '');
+}
+function consumeNotifications(feed: NotificationFeed | undefined): void {
+  if (!feed) return;
+  const previous = notificationCursor;
+  if (!previous || previous.generation !== feed.cursor.generation) {
+    notificationCursor = feed.cursor; acknowledgeNotifications(); return;
+  }
+  // Concurrent refreshes can share a cursor. Accept each publication only once.
+  if (feed.cursor.lastResId <= previous.lastResId) return;
+  const items = feed.items.filter((item) => item.id > previous.lastResId);
+  notificationCursor = feed.cursor;
+  if (!items.length || appView.hidden || shutdownView.hidden === false) return;
+  updateNotificationBell(true);
+  if ($('notification-toast').hidden || Date.now() >= notificationToastExpiresAt) { notificationBatchCount = 0; notificationBatchTruncated = false; }
+  notificationBatchCount += items.length; notificationBatchTruncated ||= feed.truncated;
+  const latest = items.at(-1)!;
+  const label = notificationBatchCount === 1 && !notificationBatchTruncated
+    ? `${latest.authorName} · ${latest.kind === 'post' ? '새 게시글이 올라왔습니다' : '새 레스가 올라왔습니다'}`
+    : `새 글 ${notificationBatchCount.toLocaleString()}개${notificationBatchTruncated ? ' 이상' : ''}`;
+  text($('notification-toast-title'), label); $('notification-toast-open').setAttribute('aria-label', `${label} · Room 최하단으로 이동`);
+  if (notificationTimer !== undefined) window.clearTimeout(notificationTimer);
+  notificationToastExpiresAt = Date.now() + 3000;
+  $('notification-toast').hidden = document.hidden;
+  if (!document.hidden) notificationTimer = window.setTimeout(dismissNotificationToast, 3000);
+  else { notificationTimer = undefined; notificationBatchCount = 0; notificationBatchTruncated = false; notificationToastExpiresAt = 0; }
+}
+function openNotificationRoom(): void {
+  acknowledgeNotifications(); if (!state || appView.hidden) return;
+  if (postDialog.open) postDialog.close(); if (cycleDialog.open) cycleDialog.close();
+  setTab('room'); scrollRoomToLatest();
+}
+$('notification-bell').addEventListener('click', clickNotificationBell);
+$('notification-bell').addEventListener('animationend', () => $('notification-bell').classList.remove('click-feedback'));
+$('notification-toast-open').addEventListener('click', openNotificationRoom);
+document.addEventListener('visibilitychange', () => { if (document.hidden) dismissNotificationToast(); });
 
 function createMessage(message: Message, archive = false): HTMLElement {
   const row = make("article", "message"); const head = make("div", "message-head");
@@ -291,11 +364,11 @@ function renderLan(): void { if (!state) return; const list = $("lan-addresses")
 
 async function openPost(id: string): Promise<void> { const epoch = roomEpoch; try { const post = await api<Post>(`/api/posts/${id}`); if (epoch !== roomEpoch) return; postDialog.dataset.postId = id; text($("dialog-post-meta"), `P${post.id} · ${post.author.displayName} · ${fmtTime(post.createdAt)}`); text($("dialog-post-title"), post.title); text($("dialog-post-body"), post.body); postDialog.showModal(); } catch (error) { showError(error instanceof Error ? error.message : "게시글을 열 수 없습니다."); } }
 async function refreshOpenPost(id: string): Promise<void> { try { const post = await api<Post>(`/api/posts/${id}`); if (postDialog.open && postDialog.dataset.postId === id) { text($('dialog-post-title'), post.title); text($('dialog-post-body'), post.body); } } catch { if (postDialog.open && postDialog.dataset.postId === id) postDialog.close(); } }
-function setTab(tab: string): void { activeTab = tab; for (const button of document.querySelectorAll<HTMLButtonElement>(".tab")) button.classList.toggle("active", button.dataset.tab === tab); for (const panel of document.querySelectorAll<HTMLElement>(".tab-panel")) { const active = panel.id === `tab-${tab}`; panel.hidden = !active; panel.classList.toggle("active", active); } hideError(); if (tab === 'memos') invalidateDeletedMemos(); renderActive(); scrollRoomToLatest(); if (tab === 'prompts') void renderPrompts(); }
-async function refresh(): Promise<void> { try { await loadState(); hideError(); } catch (error) { if (error instanceof Error && /로그인|접속 토큰|401/.test(error.message)) showLogin(); else { $("connection-state").textContent = "연결 재시도 중"; showError(error instanceof Error ? error.message : "새 정보를 가져오지 못했습니다."); } } }
+function setTab(tab: string): void { activeTab = tab; for (const button of document.querySelectorAll<HTMLButtonElement>(".tab")) button.classList.toggle("active", button.dataset.tab === tab); for (const panel of document.querySelectorAll<HTMLElement>(".tab-panel")) { const active = panel.id === `tab-${tab}`; panel.hidden = !active; panel.classList.toggle("active", active); } hideError(); if (tab === 'memos') invalidateDeletedMemos(); renderActive(); scrollRoomToLatest(); if (tab === 'prompts') void renderPrompts(); if (tab === 'dashboard') syncDashboard(true); else pauseDashboard(); }
+async function refresh(): Promise<void> { try { if (await loadState()) hideError(); } catch (error) { if (error instanceof Error && /로그인|접속 토큰|401/.test(error.message)) showLogin(); else { $("connection-state").textContent = "연결 재시도 중"; showError(error instanceof Error ? error.message : "새 정보를 가져오지 못했습니다."); } } }
 function resetDeletedMemos(): void { memoContextVersion++; invalidateDeletedMemos(); deletedMemos = []; showDeletedMemos = false; deletingMemoIds.clear(); clear($('memo-list')); }
-function showLogin(): void { if (refreshTimer) window.clearInterval(refreshTimer); resetConnectionEditing(); resetDeletedMemos(); manageFingerprint = ""; appView.hidden = true; loginView.hidden = false; loginToken.focus(); }
-function showApp(): void { loginView.hidden = true; appView.hidden = false; scrollRoomToLatest(); if (activeTab === 'prompts') void renderPrompts(); if (refreshTimer) window.clearInterval(refreshTimer); refreshTimer = window.setInterval(() => void refresh(), 4000); }
+function showLogin(): void { if (refreshTimer) window.clearInterval(refreshTimer); resetNotifications(); resetDashboard(); resetConnectionEditing(); resetDeletedMemos(); manageFingerprint = ""; appView.hidden = true; loginView.hidden = false; loginToken.focus(); }
+function showApp(): void { loginView.hidden = true; appView.hidden = false; scrollRoomToLatest(); if (activeTab === 'prompts') void renderPrompts(); if (refreshTimer) window.clearInterval(refreshTimer); refreshTimer = window.setInterval(() => void refresh(), 4000); syncDashboard(true); }
 
 loginForm.addEventListener("submit", async (event) => { event.preventDefault(); hideError(true); const token = loginToken.value; try { await api("/api/login", { method: "POST", body: JSON.stringify({ token }) }); loginToken.value = ""; showApp(); await refresh(); } catch (error) { loginToken.value = ""; showError(error instanceof Error ? error.message : "로그인에 실패했습니다.", true); } });
 resForm.addEventListener("submit", async (event) => { event.preventDefault(); if (!resMessage.value.trim()) return; try { await api("/api/res", { method: "POST", body: JSON.stringify({ message: resMessage.value }) }); resMessage.value = ""; await refresh(); } catch (error) { showError(error instanceof Error ? error.message : "레스 저장에 실패했습니다."); } });
@@ -343,7 +416,7 @@ document.querySelectorAll<HTMLButtonElement>(".tab").forEach((button) => button.
 $("post-dialog-close").addEventListener("click", () => postDialog.close());
 $("cycle-dialog-close").addEventListener("click", () => cycleDialog.close());
 $("logout-button").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: "{}" }); } finally { state = null; roomFingerprint = boardFingerprint = memoFingerprint = manageFingerprint = ""; showLogin(); } });
-$("shutdown-button").addEventListener("click", async () => { if (!window.confirm("Room Server를 지금 종료할까요? 진행 중 모델 호출은 무효화되고, 이 브라우저의 Room 접근도 끊깁니다.")) return; try { await api("/api/shutdown", { method: "POST", body: "{}" }); resetConnectionEditing(); if (refreshTimer) window.clearInterval(refreshTimer); appView.hidden = true; shutdownView.hidden = false; } catch (error) { showError(error instanceof Error ? error.message : "서버 종료 요청에 실패했습니다."); } });
+$("shutdown-button").addEventListener("click", async () => { if (!window.confirm("Room Server를 지금 종료할까요? 진행 중 모델 호출은 무효화되고, 이 브라우저의 Room 접근도 끊깁니다.")) return; try { await api("/api/shutdown", { method: "POST", body: "{}" }); resetNotifications(); resetDashboard(); resetConnectionEditing(); if (refreshTimer) window.clearInterval(refreshTimer); appView.hidden = true; shutdownView.hidden = false; } catch (error) { showError(error instanceof Error ? error.message : "서버 종료 요청에 실패했습니다."); } });
 
 async function updateParticipant(id: string, patch: Record<string, unknown>): Promise<void> { try { await api(`/api/participants/${id}`, { method: "PATCH", body: JSON.stringify(patch) }); await refresh(); } catch (error) { showError(error instanceof Error ? error.message : "참가자 설정을 저장하지 못했습니다."); } }
 async function deleteParticipant(id: string, button: HTMLButtonElement): Promise<void> {
@@ -483,6 +556,179 @@ function filterSelect(labelText: string, items: Array<{ id: string; displayName?
   const label = make('label'); text(label, labelText); const select = make('select'); const all = make('option'); all.value = ''; text(all, '전체'); select.append(all);
   for (const item of items) { const option = make('option'); option.value = item.id; text(option, `${item.displayName ?? item.name ?? item.id}${item.deleted ? ' · 삭제됨' : ''}`); select.append(option); } select.value = selected; select.addEventListener('change', () => change(select.value)); label.append(select); return label;
 }
+
+function dashboardVisible(): boolean { return Boolean(state) && activeTab === 'dashboard' && !appView.hidden && !document.hidden && shutdownView.hidden; }
+function pauseDashboard(): void {
+  if (dashboardTimer !== undefined) window.clearTimeout(dashboardTimer);
+  dashboardTimer = undefined; dashboardPending = false; dashboardEpoch++; dashboardRequest?.abort();
+}
+function syncDashboard(immediate = false): void {
+  if (!dashboardVisible()) { pauseDashboard(); return; }
+  if (immediate && dashboardTimer !== undefined) { window.clearTimeout(dashboardTimer); dashboardTimer = undefined; }
+  if (dashboardRequest) { if (immediate) dashboardPending = true; return; }
+  if (dashboardTimer === undefined) void requestDashboard();
+}
+function resetDashboard(): void {
+  pauseDashboard(); dashboardFingerprint = ''; dashboardPeriod = '7d'; dashboardMode = 'real'; dashboardParticipant = dashboardConnection = '';
+  ($('dashboard-period') as HTMLSelectElement).value = dashboardPeriod; ($('dashboard-mode') as HTMLSelectElement).value = dashboardMode;
+  for (const id of ['dashboard-participant', 'dashboard-connection']) updateDashboardChoices(id, [], '');
+  clear($('dashboard-summary')); clear($('dashboard-charts')); $('dashboard-error').hidden = true;
+  text($('dashboard-status'), '대시보드를 열면 집계합니다.');
+}
+function changeDashboardFilters(): void {
+  dashboardPeriod = ($('dashboard-period') as HTMLSelectElement).value; dashboardMode = ($('dashboard-mode') as HTMLSelectElement).value;
+  dashboardParticipant = ($('dashboard-participant') as HTMLSelectElement).value; dashboardConnection = ($('dashboard-connection') as HTMLSelectElement).value;
+  pauseDashboard(); dashboardFingerprint = ''; clear($('dashboard-summary')); clear($('dashboard-charts')); $('dashboard-error').hidden = true;
+  syncDashboard(true);
+}
+async function requestDashboard(): Promise<void> {
+  if (!dashboardVisible() || dashboardRequest) return;
+  const request = new AbortController(), epoch = dashboardEpoch;
+  dashboardRequest = request; dashboardPending = false; ($('dashboard-refresh') as HTMLButtonElement).disabled = true;
+  const query = new URLSearchParams({ period: dashboardPeriod, mode: dashboardMode });
+  if (dashboardParticipant) query.set('participantId', dashboardParticipant); if (dashboardConnection) query.set('connectionId', dashboardConnection);
+  if (!dashboardFingerprint) text($('dashboard-status'), '집계 중…');
+  try {
+    const data = await api<DashboardData>(`/api/dashboard?${query}`, { signal: request.signal });
+    if (epoch !== dashboardEpoch || !dashboardVisible()) return;
+    $('dashboard-error').hidden = true;
+    updateDashboardChoices('dashboard-participant', data.choices.participants, dashboardParticipant);
+    updateDashboardChoices('dashboard-connection', data.choices.connections, dashboardConnection);
+    // The advancing end time is metadata; unchanged values retain chart DOM, focus and open tables.
+    const fingerprint = JSON.stringify({ from: data.range.from, timeZone: data.range.timeZone, bucket: data.range.bucket, mode: dashboardMode,
+      totals: data.totals, buckets: data.buckets.map(({ end: _end, ...bucket }) => bucket), participants: data.participants });
+    if (fingerprint !== dashboardFingerprint) { dashboardFingerprint = fingerprint; renderDashboard(data); }
+    const date = new Intl.DateTimeFormat('ko-KR', { dateStyle: 'short', timeStyle: 'short', timeZone: data.range.timeZone });
+    text($('dashboard-status'), `${date.format(data.range.from)} ~ ${date.format(data.range.to)} · ${data.range.timeZone} · ${dashboardMode === 'mock' ? 'Mock 모의 호출' : '실제 호출'} · 화면이 보일 때 15초마다 갱신`);
+  } catch (error) {
+    if (epoch !== dashboardEpoch || request.signal.aborted || !dashboardVisible()) return;
+    if (error instanceof ApiError && error.status === 401) { showLogin(); return; }
+    text($('dashboard-error'), `${error instanceof Error ? error.message : '집계에 실패했습니다.'} 다음 갱신 때 다시 시도합니다.`); $('dashboard-error').hidden = false;
+    text($('dashboard-status'), dashboardFingerprint ? '갱신 실패 · 마지막 성공한 집계입니다.' : '집계 정보를 불러오지 못했습니다.');
+  } finally {
+    if (dashboardRequest === request) dashboardRequest = undefined;
+    ($('dashboard-refresh') as HTMLButtonElement).disabled = false;
+    if (dashboardVisible()) {
+      if (dashboardPending) { dashboardPending = false; void requestDashboard(); }
+      else dashboardTimer = window.setTimeout(() => { dashboardTimer = undefined; void requestDashboard(); }, 15000);
+    }
+  }
+}
+function updateDashboardChoices(id: string, items: Array<{ id: string; displayName: string | null; deleted: boolean }>, selected: string): void {
+  const select = $(id) as HTMLSelectElement;
+  const entries = items.map((item) => ({ value: item.id, label: `${item.displayName ?? item.id}${item.deleted ? ' · 삭제됨' : ''}` }));
+  if (selected && !items.some((item) => item.id === selected)) entries.push({ value: selected, label: select.selectedOptions[0]?.textContent ?? selected });
+  const fingerprint = JSON.stringify(entries);
+  if (select.dataset.choices !== fingerprint) { select.dataset.choices = fingerprint; clear(select); const all = make('option'); all.value = ''; text(all, '전체'); select.append(all);
+    for (const entry of entries) { const option = make('option'); option.value = entry.value; text(option, entry.label); select.append(option); } }
+  select.value = selected;
+}
+function dashboardNumber(value: number | null): string { return value === null ? '미제공' : value.toLocaleString('ko-KR'); }
+function dashboardToken(value: number | null, known: number, calls: number): string {
+  if (!calls) return '0';
+  return `${dashboardNumber(value)}${known < calls && known > 0 ? ' (일부)' : ''}`;
+}
+function dashboardUsageDetail(row: DashboardUsage): string {
+  return `호출 ${row.calls.toLocaleString()} · 입력 ${dashboardToken(row.inputTokens, row.inputKnownCalls, row.calls)} / 출력 ${dashboardToken(row.outputTokens, row.outputKnownCalls, row.calls)} · 토큰 제공 입력 ${row.inputKnownCalls}/${row.calls}, 출력 ${row.outputKnownCalls}/${row.calls}건`;
+}
+function openDashboardRecords(tab: 'usage' | 'cycles', participantId = dashboardParticipant): void {
+  if (tab === 'usage') { usageParticipant = participantId; usageConnection = dashboardConnection; usageBefore = undefined; }
+  else { cycleParticipant = participantId; cycleBefore = undefined; }
+  setTab(tab);
+}
+function svgElement<K extends keyof SVGElementTagNameMap>(tag: K, attributes: Record<string, string | number> = {}): SVGElementTagNameMap[K] {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value)); return node;
+}
+function chartSvg(label: string, height = 220): SVGSVGElement { return svgElement('svg', { viewBox: `0 0 520 ${height}`, role: 'group', 'aria-label': label }); }
+function chartText(svg: SVGSVGElement, x: number, y: number, label: string, anchor = 'start'): void { const node = svgElement('text', { x, y, class: 'chart-axis-label', 'text-anchor': anchor }); text(node, label); svg.append(node); }
+function chartInteractive(node: SVGElement, label: string, detail: HTMLElement): void {
+  node.setAttribute('tabindex', '0'); node.setAttribute('role', 'button'); node.setAttribute('aria-label', label);
+  const title = svgElement('title'); text(title, label); node.append(title);
+  const show = () => text(detail, label); node.addEventListener('pointerenter', show); node.addEventListener('focus', show); node.addEventListener('click', show);
+  node.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); show(); } });
+}
+function chartCard(title: string, note: string, legend: Array<[string, string]> = []): { card: HTMLElement; detail: HTMLElement } {
+  const card = make('article', 'dashboard-chart'), heading = make('h3'), info = make('p', 'fine'), detail = make('p', 'chart-detail'); text(heading, title); text(info, note);
+  text(detail, '그래프를 누르거나 키보드로 선택하면 정확한 수치를 표시합니다.'); detail.setAttribute('aria-live', 'polite');
+  card.append(heading, info);
+  if (legend.length) { const labels = make('div', 'chart-legend'); for (const [label, color] of legend) { const item = make('span'), swatch = make('i', `chart-swatch ${color}`); swatch.setAttribute('aria-hidden', 'true'); item.append(swatch, document.createTextNode(label)); labels.append(item); } card.append(labels); }
+  return { card, detail };
+}
+function chartTable(card: HTMLElement, headers: string[], rows: Array<{ cells: string[]; open?: () => void }>): void {
+  const details = make('details'), summary = make('summary'), table = make('table', 'chart-table'), head = make('thead'), header = make('tr'), body = make('tbody'); text(summary, '수치 표 · 기록 보기');
+  for (const name of headers) { const cell = make('th'); cell.scope = 'col'; text(cell, name); header.append(cell); } head.append(header);
+  for (const row of rows) { const tr = make('tr'); row.cells.forEach((value, index) => { const cell = make('td'); if (!index && row.open) { const button = make('button'); button.type = 'button'; text(button, value); button.addEventListener('click', row.open); cell.append(button); } else text(cell, value); tr.append(cell); }); body.append(tr); }
+  table.append(head, body); details.append(summary, table); card.append(details);
+}
+function chartRecordsButton(card: HTMLElement, tab: 'usage' | 'cycles'): void {
+  const button = make('button', 'quiet'); button.type = 'button'; text(button, `${tab === 'usage' ? 'Usage' : 'Cycles'} 기록 보기`); button.addEventListener('click', () => openDashboardRecords(tab)); card.append(button);
+  const note = make('p', 'fine'); text(note, tab === 'usage' ? '전체 기간의 기록으로 이동합니다. 참가자·Connection 필터를 이어받으며 호출 종류는 기록에서 확인합니다.' : '전체 기간의 Cycle 기록으로 이동합니다. 참가자 필터를 이어받습니다.'); card.append(note);
+}
+function renderDashboard(data: DashboardData): void {
+  const summary = $('dashboard-summary'), charts = $('dashboard-charts'); clear(summary); clear(charts);
+  const totals = data.totals, cycles = totals.cycles;
+  for (const [label, value, note] of [
+    ['LLM 요청', totals.calls.toLocaleString(), 'Usage 요청 건수'],
+    ['입력 토큰', dashboardToken(totals.inputTokens, totals.inputKnownCalls, totals.calls), `${totals.inputKnownCalls}/${totals.calls}건 제공`],
+    ['출력 토큰', dashboardToken(totals.outputTokens, totals.outputKnownCalls, totals.calls), `${totals.outputKnownCalls}/${totals.calls}건 제공`],
+    ['실패한 Cycle', cycles.failed.toLocaleString(), `완료 ${cycles.completed} · 중단 ${cycles.abandoned} · 입력 제한 ${cycles.input_blocked} · 진행 ${cycles.calling}`],
+  ]) { const card = make('div', 'dashboard-stat'), name = make('p', 'fine'), number = make('strong'), info = make('p', 'fine'); text(name, label); text(number, value); text(info, note); card.append(name, number, info); summary.append(card); }
+  if (totals.unclassifiedCycles) { const note = make('p', 'fine'); text(note, `호출 종류를 확인할 수 없는 Cycle ${totals.unclassifiedCycles}건은 실제·Mock 결과에서 제외했습니다.`); summary.append(note); }
+  renderDashboardTimeline(charts, data, true); renderDashboardTimeline(charts, data, false);
+  renderDashboardParticipants(charts, data, false); renderDashboardParticipants(charts, data, true);
+}
+function renderDashboardTimeline(target: HTMLElement, data: DashboardData, tokens: boolean): void {
+  const title = tokens ? '시간별 토큰 사용량' : '시간별 LLM 요청 수';
+  const { card, detail } = chartCard(title, `요청 기록 시각 기준 · ${data.range.bucket === 'hour' ? '시간' : '날짜'}별 집계${tokens ? ' · 미제공 값은 선을 연결하지 않습니다.' : ''}`, tokens ? [['입력', 'input'], ['출력', 'output']] : []);
+  const svg = chartSvg(title), rows = data.buckets, left = 62, top = 24, width = 440, height = 150;
+  const maximum = Math.max(1, ...rows.flatMap((row) => tokens ? [row.inputTokens ?? 0, row.outputTokens ?? 0] : [row.calls]));
+  for (const fraction of [0, .5, 1]) { const y = top + height * (1 - fraction); svg.append(svgElement('line', { x1: left, x2: left + width, y1: y, y2: y, class: 'chart-axis' })); chartText(svg, left - 8, y + 4, Math.round(maximum * fraction).toLocaleString(), 'end'); }
+  const x = (index: number) => left + (rows.length <= 1 ? width / 2 : index * width / (rows.length - 1));
+  const y = (value: number) => top + height * (1 - value / maximum);
+  const step = Math.max(1, Math.ceil(rows.length / 5));
+  rows.forEach((row, index) => { if (index % step === 0 || index === rows.length - 1) chartText(svg, x(index), top + height + 24, data.range.bucket === 'hour' ? row.label.slice(-5) : row.label.slice(5), index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'); });
+  if (tokens) {
+    for (const key of ['inputTokens', 'outputTokens'] as const) {
+      let points: string[] = [];
+      const flush = () => { if (points.length > 1) svg.append(svgElement('polyline', { points: points.join(' '), class: `chart-line ${key === 'inputTokens' ? 'chart-input' : 'chart-output'}` })); points = []; };
+      rows.forEach((row, index) => { const value = row.calls ? row[key] : 0; if (value === null) { flush(); return; } points.push(`${x(index)},${y(value)}`); }); flush();
+      rows.forEach((row, index) => { const value = row.calls ? row[key] : 0; if (value === null) return; const point = svgElement('circle', { cx: x(index), cy: y(value), r: 4, class: `chart-point ${key === 'inputTokens' ? 'chart-input' : 'chart-output'}` }); chartInteractive(point, `${row.label} · ${dashboardUsageDetail(row)}`, detail); svg.append(point); });
+    }
+  } else {
+    const barWidth = Math.min(24, width / Math.max(1, rows.length) * .65);
+    rows.forEach((row, index) => { if (!row.calls) return; const bar = svgElement('rect', { x: x(index) - barWidth / 2, y: y(row.calls), width: barWidth, height: height * row.calls / maximum, class: 'chart-point chart-input' }); chartInteractive(bar, `${row.label} · 호출 ${row.calls.toLocaleString()}건`, detail); svg.append(bar); });
+  }
+  card.append(svg, detail);
+  chartTable(card, tokens ? ['시각', '입력', '출력', '제공 건수 입력/출력'] : ['시각', '호출 수'], rows.map((row) => ({ cells: tokens ? [row.label, dashboardToken(row.inputTokens, row.inputKnownCalls, row.calls), dashboardToken(row.outputTokens, row.outputKnownCalls, row.calls), `${row.inputKnownCalls}/${row.calls} · ${row.outputKnownCalls}/${row.calls}`] : [row.label, String(row.calls)] })));
+  chartRecordsButton(card, 'usage'); target.append(card);
+}
+function renderDashboardParticipants(target: HTMLElement, data: DashboardData, cycles: boolean): void {
+  const rows = [...data.participants].sort((a, b) => cycles ? (b.cycles.completed + b.cycles.failed + b.cycles.abandoned + b.cycles.input_blocked) - (a.cycles.completed + a.cycles.failed + a.cycles.abandoned + a.cycles.input_blocked) : ((b.inputTokens ?? 0) + (b.outputTokens ?? 0)) - ((a.inputTokens ?? 0) + (a.outputTokens ?? 0)));
+  const title = cycles ? '참가자별 Cycle 결과' : '참가자별 토큰 사용량';
+  const { card, detail } = chartCard(title, `${cycles ? 'Cycle 시작 시각 기준 · 진행 중은 수치 표에 별도 표시' : '요청 기록 시각 기준 · 제공된 토큰만 합산'}${rows.length > 12 ? ' · 그래프 상위 12명, 표 전체' : ''}`, cycles ? [['완료', 'input'], ['실패', 'failed'], ['중단', 'abandoned'], ['입력 제한', 'input-blocked']] : [['입력', 'input'], ['출력', 'output']]);
+  const shown = rows.slice(0, 12), width = 320, left = 182, height = Math.max(70, shown.length * 36 + 44), svg = chartSvg(title, height);
+  const keys = cycles ? ['completed', 'failed', 'abandoned', 'input_blocked'] as const : ['inputTokens', 'outputTokens'] as const;
+  const values = (row: DashboardData['participants'][number]): number[] => cycles ? [row.cycles.completed, row.cycles.failed, row.cycles.abandoned, row.cycles.input_blocked] : [row.inputTokens ?? 0, row.outputTokens ?? 0];
+  const maximum = Math.max(1, ...shown.map((row) => values(row).reduce((sum, value) => sum + value, 0)));
+  const name = (row: DashboardData['participants'][number]) => `${row.displayName ?? row.id}${row.deleted ? ' · 삭제됨' : ''}`;
+  shown.forEach((row, index) => {
+    const label = name(row), y = 12 + index * 36; chartText(svg, left - 10, y + 17, label.length > 20 ? label.slice(0, 19) + '…' : label, 'end');
+    let offset = 0; values(row).forEach((value, part) => { if (!value) return; const barWidth = width * value / maximum;
+      const bar = svgElement('rect', { x: left + offset, y, width: barWidth, height: 24, class: `chart-point chart-${cycles ? String(keys[part]).replace('_', '-') : part === 0 ? 'input' : 'output'}` });
+      const detailText = cycles ? `${label} · 완료 ${row.cycles.completed} / 실패 ${row.cycles.failed} / 중단 ${row.cycles.abandoned} / 입력 제한 ${row.cycles.input_blocked} / 진행 ${row.cycles.calling}` : `${label} · ${dashboardUsageDetail(row)}`;
+      chartInteractive(bar, detailText, detail); svg.append(bar); offset += barWidth;
+    });
+    if (!offset) chartText(svg, left, y + 17, cycles ? `종료된 Cycle 없음 · 진행 ${row.cycles.calling}` : row.calls ? '토큰 미제공 또는 0' : '호출 없음');
+  });
+  if (!shown.length) chartText(svg, 20, 30, '선택한 조건의 기록이 없습니다.');
+  card.append(svg, detail);
+  chartTable(card, cycles ? ['참가자', '완료', '실패', '중단', '입력 제한', '진행'] : ['참가자', '호출', '입력', '출력', '제공 건수 입력/출력'], rows.map((row) => ({ cells: cycles ? [name(row), String(row.cycles.completed), String(row.cycles.failed), String(row.cycles.abandoned), String(row.cycles.input_blocked), String(row.cycles.calling)] : [name(row), String(row.calls), dashboardToken(row.inputTokens, row.inputKnownCalls, row.calls), dashboardToken(row.outputTokens, row.outputKnownCalls, row.calls), `${row.inputKnownCalls}/${row.calls} · ${row.outputKnownCalls}/${row.calls}`], open: () => openDashboardRecords(cycles ? 'cycles' : 'usage', row.id) })));
+  chartRecordsButton(card, cycles ? 'cycles' : 'usage'); target.append(card);
+}
+for (const id of ['dashboard-period', 'dashboard-mode', 'dashboard-participant', 'dashboard-connection']) $(id).addEventListener('change', changeDashboardFilters);
+$('dashboard-refresh').addEventListener('click', () => syncDashboard(true));
+document.addEventListener('visibilitychange', () => { if (document.hidden) pauseDashboard(); else syncDashboard(true); });
+
 function pageButtons(list: HTMLElement, hasEarlier: boolean, earlier: () => void, latest: () => void): void { const bar = make('div', 'archive-batch'); const first = make('button', 'quiet'); text(first, '최근 기록'); first.addEventListener('click', latest); const more = make('button', 'quiet'); text(more, '이전 기록'); more.disabled = !hasEarlier; more.addEventListener('click', earlier); bar.append(first, more); list.append(bar); }
 async function copyText(value: string): Promise<void> { try { if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(value); else { const area = make('textarea'); area.value = value; document.body.append(area); area.select(); const copied = document.execCommand('copy'); area.remove(); if (!copied) window.prompt('복사할 내용', value); } } catch { window.prompt('복사할 내용', value); } }
 async function renderUsage(): Promise<void> {
@@ -510,11 +756,11 @@ async function renderErrors(): Promise<void> {
   } catch (error) { showError(error instanceof Error ? error.message : '오류 기록을 불러오지 못했습니다.'); }
 }
 $("force-rollover").addEventListener('click', async () => { if (!window.confirm('현재 불판을 종료하고 새 불판을 만들까요?')) return; try { await api('/api/threads/rollover', { method: 'POST', body: '{}' }); await refresh(); } catch (error) { showError(error instanceof Error ? error.message : '불판을 갈지 못했습니다.'); } });
-$("hard-reset").addEventListener('click', async () => { if (($('hard-reset-confirm') as HTMLInputElement).value !== 'HARD RESET') { showError('확인 문자열 HARD RESET을 입력하세요.'); return; } try { await api('/api/reset', { method: 'POST', body: JSON.stringify({ confirmation: 'HARD RESET' }) }); (document.getElementById('hard-reset-confirm') as HTMLInputElement).value = ''; await refresh(); } catch (error) { showError(error instanceof Error ? error.message : 'Hard Reset에 실패했습니다.'); } });
+$("hard-reset").addEventListener('click', async () => { if (($('hard-reset-confirm') as HTMLInputElement).value !== 'HARD RESET') { showError('확인 문자열 HARD RESET을 입력하세요.'); return; } try { await api('/api/reset', { method: 'POST', body: JSON.stringify({ confirmation: 'HARD RESET' }) }); resetNotifications(); resetDashboard(); (document.getElementById('hard-reset-confirm') as HTMLInputElement).value = ''; await refresh(); syncDashboard(true); } catch (error) { showError(error instanceof Error ? error.message : 'Hard Reset에 실패했습니다.'); } });
 $("clear-errors").addEventListener('click', async () => { if (!window.confirm('오류 기록을 모두 비울까요?')) return; try { await api('/api/errors', { method: 'DELETE' }); errorBefore = selectedError = undefined; await renderErrors(); } catch (error) { showError(error instanceof Error ? error.message : '오류 기록을 비우지 못했습니다.'); } });
 function clearConnectionSecrets(): void { for (const input of document.querySelectorAll<HTMLTextAreaElement>('textarea[name="credential"]')) input.value = ""; }
 function resetConnectionEditing(): void { clearConnectionSecrets(); codexLoginUrls.clear(); editingConnectionId = null; clear($("connection-list")); }
 function parseOptions(value: string): Record<string, unknown> { let result: unknown; try { result = JSON.parse(value); } catch { throw new Error('모델 옵션 JSON 형식을 확인하세요.'); } if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("모델 옵션은 JSON object여야 합니다."); return result as Record<string, unknown>; }
 function configureConnectionForm(): void { const form = $("connection-form") as HTMLFormElement; const type = ( $("connection-type") as HTMLSelectElement).value; for (const element of form.querySelectorAll<HTMLElement>("[data-vertex]")) element.hidden = type !== "vertex"; for (const element of form.querySelectorAll<HTMLElement>("[data-endpoint]")) element.hidden = !(type === "oai-compatible" || type === "custom-api"); for (const element of form.querySelectorAll<HTMLElement>("[data-context]")) element.hidden = !(type === "oai-compatible" || type === "custom-api" || type === "codex"); for (const element of form.querySelectorAll<HTMLElement>("[data-codex]")) element.hidden = type !== "codex"; const credential = form.querySelector<HTMLElement>("[data-credential]")!; credential.hidden = type === "mock" || type === "codex"; const input = form.querySelector<HTMLTextAreaElement>("[name=credential]")!; input.placeholder = type === "vertex" ? "서비스 계정 JSON" : "API key (서버가 보호 저장소에 보관)"; }
 
-configureConnectionForm(); void loadState().then(showApp).catch(() => showLogin());
+configureConnectionForm(); void loadState().then((loaded) => { if (loaded && state) showApp(); }).catch(() => showLogin());
